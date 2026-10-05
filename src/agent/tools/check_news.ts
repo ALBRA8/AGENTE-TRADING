@@ -1,6 +1,8 @@
 import type { Tool } from "../types.js";
 
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? "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";
+// SEGURIDAD: la key vive SOLO en .env. Nunca hardcodear ni commitear.
+// (Una key fue filtrada en el repo público y debe rotarse en tavily.com)
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY ?? "";
 const TAVILY_URL    = "https://api.tavily.com/search";
 
 interface CheckNewsArgs {
@@ -81,6 +83,18 @@ export const checkNews: Tool = {
   async execute(args: Record<string, unknown>): Promise<string> {
     const { asset = "US30" } = args as unknown as CheckNewsArgs;
     const now = new Date();
+
+    // Fail-fast honesto: sin key no hay filtro de noticias → UNKNOWN, no simulación
+    if (!TAVILY_API_KEY) {
+      return [
+        "⚠️ **Filtro de noticias NO DISPONIBLE** (TAVILY_API_KEY ausente en .env).",
+        "",
+        "**Estado: UNKNOWN** — No se pudo verificar eventos de alto impacto.",
+        "**Regla del SOP:** sin filtro de noticias operativo, el pipeline NO debe ejecutar (EXECUTE bloqueado).",
+        "",
+        "_Configura TAVILY_API_KEY en tu .env. La key anterior fue filtrada en el repo público y debe rotarse._",
+      ].join("\n");
+    }
 
     // Queries específicas por activo
     const queries: Record<string, string[]> = {

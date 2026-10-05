@@ -14,6 +14,7 @@ import {
   getRecentMessages,
   getMemoryFragments,
 } from "../database/sqlite.js";
+import { buildPromotedLessonsBlock, triageUnresolvedErrors } from "./self_improve.js";
 import { getAllTools, executeToolByName } from "./registry.js";
 import type { AgentInput, AgentOutput, Tool } from "./types.js";
 
@@ -24,19 +25,21 @@ function buildSystemPrompt(userId: string): string {
       ? memories.map((m) => `• [${m.key}]: ${m.value}`).join("\n")
       : "No hay recuerdos previos registrados.";
 
+  // PROMOCIÓN (auto-mejora): lecciones verificadas viajan siempre en el prompt
+  const promotedBlock = buildPromotedLessonsBlock();
+
   return `Eres un Analista Senior de Trading Institucional y experto en Smart Money Concepts (SMC).
 Tu cerebro es el modelo Nemotron-3-Super operando a través de NVIDIA NIM. Especialidad: US30, BTCUSD y GBPJPY.
 
-## Perfil y Protocolo Operativo (SOP)
-**SECUENCIA OBLIGATORIA antes de cualquier análisis:**
-1. 'checkMarketHours' → validar sesión activa
-2. 'searchMarketMemory' → consultar memoria histórica de escenarios similares
-3. 'checkNews' → filtro de noticias de alto impacto
-4. 'checkDXY' → sesgo macroeconómico
-5. 'analyzeMarket' → análisis SMC técnico
-6. 'checkRVOL' → validar fuerza institucional del movimiento
-7. 'executeTradeMT5' → ejecutar orden en MetaTrader 5 local (SOLO si todos los filtros pasan)
-8. 'logTradePerformance' → registrar en memoria (SQLite + Vector DB)
+## Perfil y Protocolo Operativo (SOP v3.1 – Pipeline Institucional)
+**PARA CUALQUIER ANÁLISIS OPERATIVO SERIO usa el pipeline completo:**
+1. 'runDecisionPipeline' → protocolo institucional multi-agente (filtros paralelos + debate bull/bear + manager + plan + comité de riesgo + decisión auditada)
+2. Si y SOLO SI la decisión es EXECUTE → 'executeTradeMT5' con los parámetros del plan (el hard-gate bloqueará cualquier intento sin decisión vigente y la orden queda vinculada a la decisión para su settlement)
+3. 'reflectOnTrade' → cuando el usuario reporte resultados, errores o correcciones (auto-mejora)
+4. 'settleDecisions' → para cerrar decisiones EXECUTE vencidas y convertirlas en lecciones (también corre solo, cada hora)
+5. 'evaluateBrain' → cuando el usuario pida evaluación de calidad del agente (score 0-100 con tendencia)
+6. 'agentStatus' → para checks de salud rápidos (decisiones, settlement, dependencias)
+7. Los tools sueltos (checkNews, analyzeMarket, checkDXY…) úsalos solo para consultas informativas rápidas, NO como sustituto del pipeline.
 
 ## Reglas por Activo
 - **GBPJPY:** Solo operar en sesión de Londres (3-12 AM EST). Sin overlap = sin trade.
@@ -58,6 +61,8 @@ Tu cerebro es el modelo Nemotron-3-Super operando a través de NVIDIA NIM. Espec
 
 ## Recuerdos del usuario
 ${memoryBlock}
+
+${promotedBlock}
 
 ## Estilo de Respuesta (OBLIGATORIO)
 Simplifica los reportes al máximo. No redactes párrafos largos. Usa:
@@ -102,9 +107,17 @@ function buildHistory(userId: string): ChatCompletionMessageParam[] {
 }
 
 // ── Main Agent Loop ────────────────────────────────────────
+let triageRunCount = 0;
+
 export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
   const { userId, userMessage, onStream } = input;
   const maxIterations = Number(process.env.MAX_TOOL_ITERATIONS ?? 10);
+
+  // TRIAGE (auto-mejora): cada 5 turnos revisa errores recurrentes
+  // y los convierte en lecciones. Fire-and-forget, nunca bloquea.
+  if (++triageRunCount % 5 === 0) {
+    void triageUnresolvedErrors().catch(() => {});
+  }
 
   // 1. Persist user turn
   saveMessage(userId, "user", userMessage);

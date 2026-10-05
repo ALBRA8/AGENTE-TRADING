@@ -15,6 +15,13 @@ import { checkRVOL } from "./tools/check_rvol.js";
 import { runBacktest } from "./tools/run_backtest.js";
 import { runBacktestPro } from "./tools/run_backtest_pro.js";
 import { executeTradeMT5 } from "./tools/execute_trade_mt5.js";
+import { runDecisionPipelineTool } from "./tools/run_decision_pipeline.js";
+import { reflectOnTrade } from "./tools/reflect_on_trade.js";
+import { searchLessonsTool } from "./tools/search_lessons.js";
+import { settleDecisions } from "./tools/settle_decisions.js";
+import { evaluateBrainTool } from "./tools/evaluate_brain.js";
+import { agentStatusTool } from "./tools/agent_status.js";
+import { captureAutoError } from "./self_improve.js";
 
 // ── Register all available tools ───────────────────────────
 const TOOL_REGISTRY: Tool[] = [
@@ -29,6 +36,12 @@ const TOOL_REGISTRY: Tool[] = [
  runBacktest,
  runBacktestPro,
  executeTradeMT5,
+ runDecisionPipelineTool,
+ reflectOnTrade,
+ searchLessonsTool,
+ settleDecisions,
+ evaluateBrainTool,
+ agentStatusTool,
  // agrega más herramientas aquí conforme crece el agente
 ];
 
@@ -50,5 +63,11 @@ export async function executeToolByName(
     ).join(", ")}.`;
   }
 
-  return tool.execute(args);
+  try {
+    return await tool.execute(args);
+  } catch (err) {
+    // Auto-mejoramiento: todo fallo de herramienta se captura para triage
+    captureAutoError(name, err as Error, args);
+    throw err;
+  }
 }

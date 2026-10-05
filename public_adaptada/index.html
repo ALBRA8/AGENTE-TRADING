@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analista Trading Institucional | SMC AI</title>
+  
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- Markdown Parser (local, sin CDN) -->
+  <script src="marked.min.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="logo">
+        <span class="logo-icon">▲</span>
+        <h1>Trading Agent <span class="badge">NEMOTRON-3</span></h1>
+      </div>
+      
+      <nav class="nav-menu">
+        <a href="#" class="nav-item active" data-view="chat">
+          <i class="icon">💬</i> Chat AI
+        </a>
+        <a href="#" class="nav-item" id="nav-brain" data-view="brain">
+          <i class="icon">🧠</i> Cerebro
+        </a>
+        <a href="#" class="nav-item" id="nav-performance" data-view="brain">
+          <i class="icon">📈</i> Performance
+        </a>
+      </nav>
+
+      <div class="agent-status">
+        <div class="status-indicator"></div>
+        <span>Sistema en línea</span>
+      </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <main class="chat-container">
+      
+      <!-- Topbar -->
+      <header class="topbar">
+        <div class="topbar-info">
+          <h2 id="view-title">Analista Senior SMC</h2>
+          <p id="view-subtitle">Conectado a MetaApi | Nvidia NIM 120b</p>
+        </div>
+      </header>
+
+      <!-- Chat Messages -->
+      <div class="chat-wrapper" id="chat-wrapper">
+        <div class="chat-messages" id="chat-messages">
+          <div class="message system-message">
+            Conexión encriptada establecida. El Analista Senior US30/NAS100/XAUUSD te escucha.
+          </div>
+        </div>
+      </div>
+
+      <!-- Vista Cerebro (Observabilidad + Evaluación) -->
+      <div class="chat-wrapper brain-view" id="brain-view" hidden>
+        <div class="brain-grid">
+          <div class="glass-panel brain-card score-card">
+            <h3>🧠 Brain Score</h3>
+            <div class="score-big" id="brain-score">—</div>
+            <p class="score-verdict" id="brain-verdict"></p>
+            <div class="trend-spark" id="brain-trend"></div>
+          </div>
+          <div class="glass-panel brain-card">
+            <h3>Componentes del score</h3>
+            <div id="brain-components"></div>
+          </div>
+          <div class="glass-panel brain-card">
+            <h3>📡 Estado operativo (24h)</h3>
+            <div id="agent-status-cards"></div>
+          </div>
+          <div class="glass-panel brain-card">
+            <h3>🛡️ Seguridad y auto-mejora</h3>
+            <div id="agent-safety"></div>
+          </div>
+          <div class="glass-panel brain-card wide">
+            <h3>Números del escritorio</h3>
+            <div id="brain-stats"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings / Reasoning View (Hidden by default) -->
+      <div id="reasoning-modal" class="modal glass-panel">
+        <div class="modal-header">
+          <h3>Thought Process (Nemotron-3)</h3>
+          <button id="close-reasoning">✕</button>
+        </div>
+        <div class="modal-body" id="reasoning-body">
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div class="input-area glass-panel" id="input-area">
+        <form id="chat-form">
+          <input type="text" id="chat-input" placeholder="Comanda el análisis del US30 o ingresa directivas SMC..." autocomplete="off" autofocus />
+          <button type="submit" id="send-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+          </button>
+        </form>
+      </div>
+    </main>
+    
+  </div>
+  
+  <script src="app.js"></script>
+</body>
+</html>

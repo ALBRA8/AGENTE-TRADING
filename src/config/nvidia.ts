@@ -27,6 +27,58 @@ export const NVIDIA_CONFIG = {
   },
 } as const;
 
+// ── Tiers de modelo (patrón TradingAgents) ──────────────────────
+// quick → analistas, debaters, reflexión (barato y rápido)
+// deep  → research manager, trade planner, gate final (razonamiento profundo)
+// Se pueden sobreescribir por .env sin tocar código.
+export const MODEL_TIERS = {
+  quick: process.env.QUICK_MODEL ?? "meta/llama-3.3-70b-instruct",
+  deep: process.env.DEEP_MODEL ?? "nvidia/nemotron-3-super-120b-a12b",
+} as const;
+
+export type ModelTier = keyof typeof MODEL_TIERS;
+
+/**
+ * Llamada de chat no-streaming por tier, con retry incluido.
+ * Devuelve el texto final y el uso de tokens reportado por la API.
+ */
+export async function callLLMByTier(opts: {
+  tier: ModelTier;
+  system: string;
+  user: string;
+  maxTokens?: number;
+  temperature?: number;
+  jsonMode?: boolean;
+}): Promise<{ content: string; tokensUsed: number }> {
+  const model = MODEL_TIERS[opts.tier];
+  const resp: any = await withRetry(
+    () =>
+      (nvidiaNIMClient.chat.completions.create as any)({
+        model,
+        messages: [
+          { role: "system", content: opts.system },
+          { role: "user", content: opts.user },
+        ],
+        max_tokens: opts.maxTokens ?? 1_500,
+        temperature: opts.temperature ?? 0.4,
+        top_p: NVIDIA_CONFIG.topP,
+        stream: false,
+        ...(opts.jsonMode ? { response_format: { type: "json_object" } } : {}),
+      }),
+    `callLLMByTier(${opts.tier})`
+  );
+
+  const choice = resp?.choices?.[0];
+  const raw: any = choice?.message ?? {};
+  // Algunos modelos NIM separan el razonamiento del contenido final
+  const content: string =
+    (typeof raw.content === "string" && raw.content.trim()) ||
+    (typeof raw.reasoning_content === "string" ? raw.reasoning_content : "") ||
+    "";
+  const tokensUsed: number = resp?.usage?.total_tokens ?? 0;
+  return { content, tokensUsed };
+}
+
 // ── Validate required env vars ─────────────────────────────
 const apiKey = process.env.NVIDIA_API_KEY;
 if (!apiKey || apiKey.startsWith("nvapi-xxx")) {

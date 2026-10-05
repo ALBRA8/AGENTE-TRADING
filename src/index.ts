@@ -6,6 +6,7 @@
 import "dotenv/config";
 import { bot } from "./bot/telegram.js";
 import { startDashboard } from "./server.js";
+import { startAgentMaintenance } from "./agent/settlement.js";
 
 const AGENT_NAME = process.env.AGENT_NAME ?? "Agente Conversacional";
 
@@ -18,7 +19,10 @@ async function main() {
 `);
 
   console.log("[Boot] 🗄️  Database initialized (SQLite WAL mode)");
-  
+
+  // Mantenimiento continuo: settlement de decisiones + triage de errores
+  startAgentMaintenance();
+
   // Start Web Dashboard
   startDashboard(process.env.PORT ? parseInt(process.env.PORT) : 4000);
   
