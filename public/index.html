@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analista Trading Institucional | SMC AI</title>
+  
+  <!-- Modern Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- Markdown Parser (Simple) -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="logo">
+        <span class="logo-icon">▲</span>
+        <h1>Trading Agent <span class="badge">NEMOTRON-3</span></h1>
+      </div>
+      
+      <nav class="nav-menu">
+        <a href="#" class="nav-item active">
+          <i class="icon">💬</i> Chat AI
+        </a>
+        <a href="#" class="nav-item" id="nav-performance">
+          <i class="icon">📈</i> Performance
+        </a>
+      </nav>
+
+      <div class="agent-status">
+        <div class="status-indicator"></div>
+        <span>Sistema en línea</span>
+      </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <main class="chat-container">
+      
+      <!-- Topbar -->
+      <header class="topbar">
+        <div class="topbar-info">
+          <h2>Analista Senior SMC</h2>
+          <p>Conectado a MetaApi | Nvidia NIM 120b</p>
+        </div>
+      </header>
+      
+      <!-- Chat Messages -->
+      <div class="chat-wrapper">
+        <div class="chat-messages" id="chat-messages">
+          <div class="message system-message">
+            Conexión encriptada establecida. El Analista Senior US30/NAS100/XAUUSD te escucha.
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings / Reasoning View (Hidden by default) -->
+      <div id="reasoning-modal" class="modal glass-panel">
+        <div class="modal-header">
+          <h3>Thought Process (Nemotron-3)</h3>
+          <button id="close-reasoning">✕</button>
+        </div>
+        <div class="modal-body" id="reasoning-body">
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div class="input-area glass-panel">
+        <form id="chat-form">
+          <input type="text" id="chat-input" placeholder="Comanda el análisis del US30 o ingresa directivas SMC..." autocomplete="off" autofocus />
+          <button type="submit" id="send-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+          </button>
+        </form>
+      </div>
+    </main>
+    
+  </div>
+  
+  <script src="app.js"></script>
+</body>
+</html>

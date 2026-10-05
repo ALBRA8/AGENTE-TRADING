@@ -1,0 +1,32 @@
+{
+  "name": "agente-conversacional",
+  "version": "1.0.0",
+  "description": "Agente de IA para Trading Institucional (SMC) – Powered by Kimi K2.5 via NVIDIA NIM",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "better-sqlite3": "^11.5.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "form-data": "^4.0.0",
+    "grammy": "^1.31.0",
+    "metaapi.cloud-sdk": "^29.3.3",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.65.0",
+    "vectra": "^0.14.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
