@@ -165,6 +165,36 @@ def get_price(symbol: str):
     })
 
 
+@app.route("/symbol_info/<symbol>", methods=["GET"])
+def get_symbol_info(symbol: str):
+    """
+    Devuelve las propiedades del CONTRATO del símbolo según MT5.
+    Base del sizing exacto multi-broker en Node (tick_value/tick_size
+    en moneda de la cuenta). 404 honesto si el símbolo no existe:
+    nunca se devuelven números inventados.
+    """
+    resolved = normalize_symbol(symbol.upper())
+    info = mt5.symbol_info(resolved)
+    if info is None:
+        return jsonify({
+            "error": f"Símbolo {symbol} no encontrado en MT5 (resuelto como '{resolved}')",
+            "detail": str(mt5.last_error()),
+        }), 404
+    return jsonify({
+        "name":             info.name,
+        "digits":           info.digits,
+        "point":            info.point,
+        "trade_tick_value": info.trade_tick_value,
+        "trade_tick_size":  info.trade_tick_size,
+        "volume_min":       info.volume_min,
+        "volume_max":       info.volume_max,
+        "volume_step":      info.volume_step,
+        "contract_size":    info.trade_contract_size,
+        "currency_profit":  info.currency_profit,
+        "description":      info.description,
+    })
+
+
 @app.route("/candles/<symbol>/<timeframe>/<int:count>", methods=["GET"])
 def get_candles(symbol: str, timeframe: str, count: int):
     """
@@ -207,7 +237,10 @@ def place_order():
       "price":      12345.0,    (para límites)
       "stopLoss":   12300.0,
       "takeProfit": 12500.0,
-      "comment":    "Bot SMC"
+      "comment":    "Bot SMC",
+      "expiration": 1770000000  (opcional, epoch en SEGUNDOS; añade
+                    type_time=ORDER_TIME_SPECIFIED — sin él la orden es GTC,
+                    compatibilidad hacia atrás con clientes viejos)
     }
     """
     body = request.get_json(force=True)
@@ -221,6 +254,7 @@ def place_order():
     stop_loss   = float(body.get("stopLoss", 0))
     take_profit = float(body.get("takeProfit", 0))
     comment     = body.get("comment", "Bot-SMC-Auto")
+    expiration  = body.get("expiration")  # epoch en segundos (opcional)
 
     # Verificar que el símbolo está disponible
     info = mt5.symbol_info(symbol)
@@ -245,6 +279,16 @@ def place_order():
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if order_type == "BUY" else tick.bid
 
+    # Expiración de pendientes (Task 8-a): las decisiones del pipeline
+    # valen 15 minutos; una LIMIT GTC eterna era un riesgo del audit C5.
+    # Sin expiration → GTC (comportamiento idéntico al de siempre).
+    expiration_epoch = None
+    if expiration is not None:
+        try:
+            expiration_epoch = int(float(expiration))
+        except (TypeError, ValueError):
+            return jsonify({"error": f"expiration inválido: {expiration!r} (se espera epoch en segundos)"}), 400
+
     request_data = {
         "action":        mt5.TRADE_ACTION_PENDING if "LIMIT" in order_type or "STOP" in order_type else mt5.TRADE_ACTION_DEAL,
         "symbol":        symbol,
@@ -259,6 +303,9 @@ def place_order():
         "type_time":     mt5.ORDER_TIME_GTC,
         "type_filling":  mt5.ORDER_FILLING_IOC,
     }
+    if expiration_epoch is not None:
+        request_data["type_time"] = mt5.ORDER_TIME_SPECIFIED
+        request_data["expiration"] = expiration_epoch
 
     log.info(f"Enviando orden: {json.dumps({k: v for k, v in request_data.items() if k != 'action'}, default=str)}")
     result = mt5.order_send(request_data)
@@ -328,6 +375,8 @@ def get_pending_orders():
             "sl":         o.sl,
             "tp":         o.tp,
             "comment":    o.comment,
+            "time":       datetime.utcfromtimestamp(o.time).isoformat() + "Z",
+            "timeEpoch":  int(o.time),
         })
     return jsonify({"orders": result, "count": len(result)})
 
@@ -358,6 +407,7 @@ if __name__ == "__main__":
     log.info("  GET  /health")
     log.info("  GET  /account")
     log.info("  GET  /price/<symbol>")
+    log.info("  GET  /symbol_info/<symbol>")
     log.info("  GET  /candles/<symbol>/<timeframe>/<count>")
     log.info("  GET  /positions")
     log.info("  GET  /orders")

@@ -1,9 +1,19 @@
 // ============================================================
 // src/config/mt5bridge.ts
 // Cliente HTTP para el bridge local de MetaTrader 5
+//
+// Task 8-a: TODAS las llamadas llevan timeout con AbortController
+// (BRIDGE_TIMEOUT_MS, default 5000) — antes un bridge colgado dejaba
+// al agente colgado para siempre (hallazgo auditoría 6-b).
+// Nuevo: getSymbolInfo (sizing exacto multi-broker) y getPendingOrders
+// (limpieza de pendientes obsoletos del pipeline).
 // ============================================================
 
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL ?? "http://localhost:5001";
+const BRIDGE_TIMEOUT_MS = (() => {
+  const v = parseInt(process.env.BRIDGE_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 5000;
+})();
 
 export interface MT5Tick {
   symbol: string;
@@ -44,6 +54,9 @@ export interface MT5OrderRequest {
   stopLoss?: number;
   takeProfit?: number;
   comment?: string;
+  /** Epoch en SEGUNDOS: expiración de órdenes pendientes (ORDER_TIME_SPECIFIED).
+   *  Sin valor → GTC (compatibilidad hacia atrás con bridge viejo). */
+  expiration?: number;
 }
 
 export interface MT5OrderResult {
@@ -55,6 +68,40 @@ export interface MT5OrderResult {
   price: number;
   symbol: string;
   type: string;
+}
+
+/**
+ * Info de contrato del símbolo (GET /symbol_info/<symbol> del bridge).
+ * Base del sizing exacto multi-broker (tick_value/tick_size) — Task 8-a.
+ * Los valores monetarios vienen en la MONEDA DE LA CUENTA.
+ */
+export interface MT5SymbolInfo {
+  name: string;
+  digits: number;
+  point: number;
+  /** Valor del tick por lote (en moneda de la cuenta) para un movimiento de tradeTickSize */
+  tradeTickValue: number;
+  /** Tamaño del tick en unidades de PRECIO */
+  tradeTickSize: number;
+  volumeMin: number;
+  volumeMax: number;
+  volumeStep: number;
+  contractSize: number;
+  currencyProfit: string;
+  description: string;
+}
+
+export interface MT5PendingOrder {
+  ticket: number;
+  symbol: string;
+  type: string;
+  volume: number;
+  price: number;
+  sl: number;
+  tp: number;
+  comment: string;
+  /** ISO 8601: momento de colocación de la orden pendiente */
+  time: string;
 }
 
 export interface MT5Position {
@@ -72,19 +119,34 @@ export interface MT5Position {
 }
 
 // ── Helper ─────────────────────────────────────────────────
+/**
+ * Fetch al bridge con TIMEOUT OBLIGATORIO (AbortController).
+ * Sin esto, un bridge colgado (socket abierto sin respuesta) bloqueaba
+ * al agente indefinidamente. Timeout por env BRIDGE_TIMEOUT_MS (5000 default).
+ */
 async function bridgeFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${MT5_BRIDGE_URL}${path}`;
-  
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
+
   let res: Response;
   try {
     res = await fetch(url, {
       headers: { "Content-Type": "application/json" },
       ...options,
+      signal: controller.signal,
     });
   } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error(
+        `MT5 Bridge timeout tras ${BRIDGE_TIMEOUT_MS}ms en ${path} (bridge colgado o saturado). Sube BRIDGE_TIMEOUT_MS si tu red lo justifica.`
+      );
+    }
     throw new Error(
       `MT5 Bridge no disponible en ${MT5_BRIDGE_URL}. Asegúrate de que bridge.py esté corriendo. Error: ${(err as Error).message}`
     );
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!res.ok) {
@@ -153,6 +215,14 @@ export const MT5Bridge = {
   },
 
   /**
+   * Lista las órdenes pendientes (con comment y time para poder expirarlas).
+   */
+  async getPendingOrders(): Promise<MT5PendingOrder[]> {
+    const data = await bridgeFetch<{ orders: MT5PendingOrder[] }>("/orders");
+    return data.orders;
+  },
+
+  /**
    * Cancela una orden pendiente.
    */
   async cancelOrder(ticket: number): Promise<boolean> {
@@ -160,5 +230,30 @@ export const MT5Bridge = {
       method: "DELETE",
     });
     return data.success;
+  },
+
+  /**
+   * Información de contrato del símbolo (digits, point, tick_value,
+   * volume_step, contract_size...). Base del sizing exacto multi-broker.
+   * 404 del bridge (símbolo inexistente) → error; el llamador decide el
+   * fallback honesto (tabla PIP_VALUE_USD o rechazo).
+   */
+  async getSymbolInfo(symbol: string): Promise<MT5SymbolInfo> {
+    const raw = await bridgeFetch<Record<string, unknown>>(
+      `/symbol_info/${encodeURIComponent(symbol)}`
+    );
+    return {
+      name: String(raw.name ?? ""),
+      digits: Number(raw.digits ?? 0),
+      point: Number(raw.point ?? 0),
+      tradeTickValue: Number(raw.trade_tick_value ?? 0),
+      tradeTickSize: Number(raw.trade_tick_size ?? 0),
+      volumeMin: Number(raw.volume_min ?? 0),
+      volumeMax: Number(raw.volume_max ?? 0),
+      volumeStep: Number(raw.volume_step ?? 0),
+      contractSize: Number(raw.contract_size ?? 0),
+      currencyProfit: String(raw.currency_profit ?? ""),
+      description: String(raw.description ?? ""),
+    };
   },
 };

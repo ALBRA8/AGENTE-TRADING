@@ -1,13 +1,14 @@
 {
   "name": "agente-conversacional",
   "version": "1.0.0",
-  "description": "Agente de IA para Trading Institucional (SMC) – Powered by Kimi K2.5 via NVIDIA NIM",
+  "description": "Agente de IA para Trading Institucional (SMC) – NVIDIA NIM (deep: nvidia/nemotron-3-super-120b-a12b · quick: meta/llama-3.3-70b-instruct) + bridge MT5 local",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe')"
   },
   "dependencies": {
     "@types/cors": "^2.8.19",

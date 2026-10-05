@@ -1,5 +1,5 @@
 import type { Tool } from "../types.js";
-import { MT5Bridge } from "../../config/mt5bridge.js";
+import { MT5Bridge, type MT5OrderRequest, type MT5SymbolInfo } from "../../config/mt5bridge.js";
 import {
   getRecentExecuteDecision,
   claimDecision,
@@ -9,14 +9,23 @@ import {
 
 /**
  * Herramienta de ejecución de órdenes via MT5 local (sin MetaApi)
- * SOP v3.2 con HARD-GATE ONE-SHOT:
+ * SOP v3.3 (Task 8-a) con HARD-GATE ONE-SHOT + SIZING EXACTO + DEMO POR DEFECTO:
  *  - Solo ejecuta si existe una decisión EXECUTE vigente emitida por
  *    runDecisionPipeline (≤15 min, sin decisión posterior que la invalide).
  *  - ONE-SHOT: cada decisión autoriza UNA sola orden (claim atómico en DB).
  *  - VINCULANTE: dirección obligatoria coincidente, SL acotado al plan y
  *    riesgo forzado al valor de la decisión (el LLM no puede inflarlo).
- *  - Lotaje calculado con tabla de valor-pip por activo (configurable por
- *    env). Símbolo desconocido → RECHAZO (fail-closed, sin adivinar).
+ *  - SIZING EXACTO: si el bridge expone symbol_info, el valor-pip se
+ *    calcula desde trade_tick_value/trade_tick_size (multi-broker real);
+ *    fallback honesto a la tabla PIP_VALUE_USD. Lote redondeado a
+ *    volume_step y acotado por volume_min/volume_max y MAX_LOT.
+ *  - EXPIRACIÓN: las órdenes pendientes nacen con expiration = validez de
+ *    la decisión (15 min) — se acabaron las LIMIT GTC eternas.
+ *  - MODO DEMO POR DEFECTO: sin LIVE_TRADING=true NADA se envía a MT5;
+ *    el lotaje y los precios se calculan igual y el registro queda marcado
+ *    como demo en trade_orders.
+ *  - Comentario MT5 con prefijo "AGT-<DIR>-<SIMBOLO>-<decisión>": el
+ *    pipeline lo usa para cancelar pendientes obsoletos o en contra del bias.
  */
 
 interface ExecuteTradeArgs {
@@ -32,11 +41,13 @@ interface ExecuteTradeArgs {
 const PIPELINE_GATE = (process.env.PIPELINE_GATE ?? "on").toLowerCase() !== "off";
 const MAX_RISK_PCT = Math.min(2, Math.max(0.1, parseFloat(process.env.MAX_RISK_PCT ?? "1.0")) || 1.0);
 const MAX_LOT = Math.max(0.01, parseFloat(process.env.MAX_LOT ?? "10")) || 10;
+/** Ventana de validez de la decisión EXECUTE (minutos) → expiración de la orden */
+export const DECISION_VALIDITY_MINUTES = 15;
 
 // ── Valor del pip en USD por 1 lote estándar (por unidad de pipSize) ──
 // Cuenta USD. Sobrescribible por env: PIP_VALUE_OVERRIDES='{"MY_SYMBOL":5}'
-// Si el broker usa contratos distintos, AJUSTAR AQUÍ o vía env — el sizing
-// se calcula con esta tabla; el símbolo fuera de tabla se rechaza.
+// TABLA DE FALLBACK: solo se usa si el bridge no expone symbol_info.
+// Con symbol_info disponible, el valor se calcula del contrato real.
 const PIP_VALUE_USD: Record<string, number> = {
   US30: 1,     // índice: contrato por punto ($1/punto/lote convención Vantage)
   NAS100: 1,
@@ -70,12 +81,124 @@ function loadPipOverrides(): Record<string, number> {
   }
 }
 
+// ═══════════════════════════════════════════════════════════
+// Sizing exacto (funciones puras exportadas para tests)
+// ═══════════════════════════════════════════════════════════
+
+export type PipValueSource = "symbol_info" | "tabla_PIP_VALUE_USD";
+
+/**
+ * Valor del pip del plan (pipSize unidades de precio) por 1 lote, en
+ * moneda de la cuenta.
+ *
+ * Matemática con symbol_info: trade_tick_value es el valor de UN tick
+ * (de tamaño trade_tick_size) POR LOTE → el valor de 1.0 unidad de
+ * precio por lote es tick_value / tick_size, y un "pip" del plan que
+ * mide `pipSize` unidades de precio vale (tick_value / tick_size) × pipSize.
+ * Ej. XAUUSD (tick 0.01 → $1 por 100oz): (1 / 0.01) × 1.0 = $100/pip/lote.
+ *
+ * Fallback: tabla PIP_VALUE_USD + overrides por env. Null = símbolo
+ * desconocido → el llamador debe RECHAZAR (fail-closed, nunca adivinar).
+ */
+export function computePipValueUSD(
+  symbol: string,
+  pipSize: number,
+  info?: MT5SymbolInfo | null
+): { value: number; source: PipValueSource } | null {
+  if (info && info.tradeTickValue > 0 && info.tradeTickSize > 0 && pipSize > 0) {
+    return { value: (info.tradeTickValue / info.tradeTickSize) * pipSize, source: "symbol_info" };
+  }
+  const overrides = loadPipOverrides();
+  const tableValue = overrides[symbol] ?? PIP_VALUE_USD[symbol];
+  if (tableValue && tableValue > 0) return { value: tableValue, source: "tabla_PIP_VALUE_USD" };
+  return null;
+}
+
+export interface LotSizing {
+  lotSize: number;
+  rawLotSize: number;
+  realRisk: number;
+  riskPerLot: number;
+  usdPerPipPerLot: number;
+  source: PipValueSource;
+  /** below_min: ni el lote mínimo respeta el riesgo | invalid: datos incoherentes */
+  rejected?: "below_min" | "invalid";
+}
+
+/**
+ * Lote para arriesgar `riskAmount` con un SL de `stopLossPips` pips,
+ * redondeado SIEMPRE HACIA ABAJO al volume_step del símbolo y acotado
+ * por volume_min, volume_max del broker y MAX_LOT del agente.
+ * Redondear hacia abajo garantiza que el riesgo real ≤ riesgo planificado.
+ */
+export function computeLotFromRisk(
+  riskAmount: number,
+  stopLossPips: number,
+  usdPerPipPerLot: number,
+  source: PipValueSource,
+  info?: MT5SymbolInfo | null
+): LotSizing {
+  const riskPerLot = stopLossPips * usdPerPipPerLot;
+  const raw = riskPerLot > 0 && Number.isFinite(riskPerLot) ? riskAmount / riskPerLot : NaN;
+  const base: LotSizing = {
+    lotSize: 0,
+    rawLotSize: Number.isFinite(raw) ? raw : 0,
+    realRisk: 0,
+    riskPerLot,
+    usdPerPipPerLot,
+    source,
+  };
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return { ...base, rejected: "invalid" };
+  }
+
+  const step = info && info.volumeStep > 0 ? info.volumeStep : 0.01;
+  const min = info && info.volumeMin > 0 ? info.volumeMin : 0.01;
+  const brokerMax = info && info.volumeMax > 0 ? info.volumeMax : Number.MAX_SAFE_INTEGER;
+  const max = Math.min(MAX_LOT, brokerMax);
+
+  let lot = parseFloat((Math.floor(raw / step + 1e-9) * step).toFixed(8));
+  if (lot < min) {
+    return { ...base, lotSize: lot, rawLotSize: raw, realRisk: lot * riskPerLot, rejected: "below_min" };
+  }
+  if (lot > max) {
+    lot = parseFloat((Math.floor(max / step + 1e-9) * step).toFixed(8));
+  }
+  return { ...base, lotSize: lot, rawLotSize: raw, realRisk: lot * riskPerLot };
+}
+
+/** Epoch (segundos) en el que expira la orden pendiente = validez de la decisión */
+export function buildOrderExpiration(validMinutes: number = DECISION_VALIDITY_MINUTES): number {
+  return Math.floor(Date.now() / 1000) + Math.round(validMinutes * 60);
+}
+
+/**
+ * Tamaño del "pip" del plan en unidades de precio. Si hay symbol_info se
+ * aplica la regla MT5 clásica (pip = point×10 en símbolos de 3/5 dígitos);
+ * si no, tabla conocida o heurística por dígitos (comportamiento histórico).
+ */
+function resolvePipSize(symbol: string, digits: number, info: MT5SymbolInfo | null): number {
+  const tabled = PIP_SIZE_BY_SYMBOL[symbol];
+  if (tabled) return tabled;
+  if (info && info.point > 0) {
+    return digits === 3 || digits === 5 ? info.point * 10 : info.point;
+  }
+  return digits <= 2 ? 1 : 0.0001;
+}
+
+function formatPipValue(value: number, source: PipValueSource): string {
+  return source === "symbol_info"
+    ? `${value.toFixed(2)}$/pip/lote (symbol_info del broker)`
+    : `${value}$/pip/lote (tabla PIP_VALUE_USD — añade symbol_info al bridge para exactitud total)`;
+}
+
 export const executeTradeMT5: Tool = {
   definition: {
     type: "function",
     function: {
       name: "executeTradeMT5",
-      description: "Ejecuta una orden Limit en MetaTrader 5 local via bridge. Calcula el lotaje automáticamente según el balance y el riesgo. SOLO usar cuando ChoCh M1 está confirmado, RVOL >= 1.5x y checkMarketHours aprueba la sesión. Requiere decisión EXECUTE vigente del pipeline (hard-gate one-shot).",
+      description: "Ejecuta una orden Limit en MetaTrader 5 local via bridge. Calcula el lotaje con symbol_info del broker (tick_value/tick_size) o tabla fallback. MODO DEMO POR DEFECTO: sin LIVE_TRADING=true la orden NO se envía a MT5 (solo se calcula y se registra). SOLO usar cuando el pipeline emita una decisión EXECUTE vigente (hard-gate one-shot).",
       parameters: {
         type: "object",
         properties: {
@@ -116,17 +239,17 @@ export const executeTradeMT5: Tool = {
     } = args as unknown as ExecuteTradeArgs;
     const symbol = String(rawSymbol).trim().toUpperCase();
 
-    // ── HARD-GATE (SOP v3.2) ────────────────────────────────
+    // ── HARD-GATE (SOP v3.2, one-shot — sin cambios funcionales) ──
     let gatedDecisionId: number | undefined;
     let boundRiskPct = Math.min(MAX_RISK_PCT, Math.max(0.1, riskPercentage ?? 0.5));
 
     if (PIPELINE_GATE) {
-      const decision = getRecentExecuteDecision(symbol, 15);
+      const decision = getRecentExecuteDecision(symbol, DECISION_VALIDITY_MINUTES);
       if (!decision) {
         return [
           `🚫 **EJECUCIÓN BLOQUEADA POR EL HARD-GATE (SOP v3.2)**`,
           ``,
-          `No hay una decisión **EXECUTE** vigente, sin consumir y sin decisiones posteriores para **${symbol}** (ventana: 15 minutos).`,
+          `No hay una decisión **EXECUTE** vigente, sin consumir y sin decisiones posteriores para **${symbol}** (ventana: ${DECISION_VALIDITY_MINUTES} minutos).`,
           ``,
           `**Qué hacer:** ejecuta primero \`runDecisionPipeline\` con este activo. Si la decisión es EXECUTE, esta orden pasará.`,
           ``,
@@ -171,32 +294,26 @@ export const executeTradeMT5: Tool = {
     }
 
     try {
-      // 2. Obtener balance y precio actual
+      // 2. Obtener balance, precio actual e info de contrato del símbolo
       const [account, tick] = await Promise.all([
         MT5Bridge.getAccount(),
         MT5Bridge.getPrice(symbol),
       ]);
+      // symbol_info NO es crítico para proceder: si falla cae a la tabla
+      // PIP_VALUE_USD (fallback honesto ya auditado), pero se intenta primero
+      // porque es la única vía de sizing exacto multi-broker.
+      let symbolInfo: MT5SymbolInfo | null = null;
+      try {
+        symbolInfo = await MT5Bridge.getSymbolInfo(symbol);
+      } catch {
+        symbolInfo = null;
+      }
 
       const balance = account.balance;
       const riskAmount = balance * (boundRiskPct / 100);
       const ask = tick.ask;
       const bid = tick.bid;
-      const digits = tick.digits;
-
-      // 3. Valor del pip: tabla honesta por símbolo (fail-closed)
-      //    Símbolo fuera de tabla sin override → RECHAZO, nunca adivinar.
-      const overrides = loadPipOverrides();
-      const pipValue = overrides[symbol] ?? PIP_VALUE_USD[symbol];
-      if (!pipValue || pipValue <= 0) {
-        if (gatedDecisionId) releaseDecision(gatedDecisionId);
-        return [
-          `🚫 **Símbolo ${symbol} no está en la tabla de valor-pip (PIP_VALUE_USD).**`,
-          ``,
-          `El sizing requiere el valor real del pip para no arriesgar de más. Dos opciones:`,
-          `1. Añade el símbolo a \`PIP_VALUE_USD\` en \`execute_trade_mt5.ts\`.`,
-          `2. Exporta \`PIP_VALUE_OVERRIDES='{"${symbol}": <usd_por_pip_por_lote>}'\` en tu .env.`,
-        ].join("\n");
-      }
+      const digits = symbolInfo && symbolInfo.digits > 0 ? symbolInfo.digits : tick.digits;
 
       // Validación de sanidad del SL (código, no LLM)
       if (!Number.isFinite(stopLossPips) || stopLossPips <= 0 || stopLossPips > 10_000) {
@@ -204,21 +321,41 @@ export const executeTradeMT5: Tool = {
         return `🚫 **SL inválido (${stopLossPips}).** Debe ser un número positivo y razonable de pips/puntos.`;
       }
 
-      // 4. Calcular lotaje con el riesgo definido (cap de seguridad MAX_LOT)
-      const riskPerLot = stopLossPips * pipValue;
-      const rawLotSize = riskAmount / riskPerLot;
-      const lotSize = Math.min(MAX_LOT, Math.max(0.01, Math.floor(rawLotSize * 100) / 100));
-      const realRisk = lotSize * riskPerLot;
-
-      // Si el lote mínimo (0.01) ya excede el riesgo previsto, avisar con claridad
-      if (rawLotSize < 0.01) {
+      // 3. Valor del pip: symbol_info (exacto) → tabla honesta → RECHAZO
+      const pipSize = resolvePipSize(symbol, digits, symbolInfo);
+      const pipValueInfo = computePipValueUSD(symbol, pipSize, symbolInfo);
+      if (!pipValueInfo) {
         if (gatedDecisionId) releaseDecision(gatedDecisionId);
-        return `🚫 **Riesgo incompatible con el lotaje mínimo**: 0.01 lotes arriesgaría $${(0.01 * riskPerLot).toFixed(2)} pero el plan permite $${riskAmount.toFixed(2)} (${boundRiskPct}%). Reduce el SL o sube el riesgo en el plan si lo aceptas conscientemente.`;
+        return [
+          `🚫 **Símbolo ${symbol} sin fuente de valor-pip (fail-closed).**`,
+          ``,
+          `Ni el bridge expone \`symbol_info\` para este símbolo ni está en la tabla \`PIP_VALUE_USD\`.`,
+          `El sizing exige el valor real del pip para no arriesgar de más. Opciones:`,
+          `1. Verifica que \`GET /symbol_info/${symbol}\` responda 200 desde el bridge (el símbolo debe existir en MT5).`,
+          `2. Añade el símbolo a \`PIP_VALUE_USD\` en \`execute_trade_mt5.ts\`.`,
+          `3. Exporta \`PIP_VALUE_OVERRIDES='{"${symbol}": <usd_por_pip_por_lote>}'\` en tu .env.`,
+        ].join("\n");
       }
+      const pipValue = pipValueInfo.value;
+
+      // 4. Calcular lotaje exacto (round-down a volume_step, caps volume_min/max + MAX_LOT)
+      const sizing = computeLotFromRisk(riskAmount, stopLossPips, pipValue, pipValueInfo.source, symbolInfo);
+      if (sizing.rejected === "invalid") {
+        if (gatedDecisionId) releaseDecision(gatedDecisionId);
+        return `🚫 **Datos de sizing incoherentes:** riesgo $${riskAmount.toFixed(2)}, SL ${stopLossPips} pips, valor-pip ${pipValue}. No se envía nada a MT5.`;
+      }
+      if (sizing.rejected === "below_min") {
+        if (gatedDecisionId) releaseDecision(gatedDecisionId);
+        const minLot = symbolInfo && symbolInfo.volumeMin > 0 ? symbolInfo.volumeMin : 0.01;
+        return `🚫 **Riesgo incompatible con el lotaje mínimo**: ${minLot} lotes arriesgaría $${(minLot * sizing.riskPerLot).toFixed(2)} pero el plan permite $${riskAmount.toFixed(2)} (${boundRiskPct}%). Reduce el SL o sube el riesgo en el plan si lo aceptas conscientemente.`;
+      }
+
+      const lotSize = sizing.lotSize;
+      const realRisk = sizing.realRisk;
+      const pipValueStr = formatPipValue(pipValue, pipValueInfo.source);
 
       // 5. Definir precios de la orden límite (entrada en retroceso del 50% del SL)
       const retracementPips = stopLossPips * 0.5;
-      const pipSize = PIP_SIZE_BY_SYMBOL[symbol] ?? (digits <= 2 ? 1 : 0.0001);
 
       let entryPrice: number;
       let stopLossPrice: number;
@@ -236,24 +373,81 @@ export const executeTradeMT5: Tool = {
 
       const orderType = direction === "BUY" ? "BUY_LIMIT" : "SELL_LIMIT";
 
-      // 6. Enviar orden al bridge (si falla, liberar la decisión reclamada)
+      // 6. Comentario auditable para MT5: el pipeline cancela pendientes por
+      //    prefijo "AGT-" + dirección/símbolo codificados aquí.
+      const baseComment = `AGT-${direction}-${symbol}-${gatedDecisionId ?? "manual"}`;
+      const mt5Comment =
+        comment && comment !== "Bot-SMC-v3"
+          ? `${baseComment}|${String(comment)}`.slice(0, 31)
+          : baseComment.slice(0, 31);
+
+      // 7. Payload con EXPIRACIÓN: la orden muere con la validez de la decisión
+      const orderPayload: MT5OrderRequest = {
+        symbol,
+        type:       orderType,
+        volume:     lotSize,
+        price:      entryPrice,
+        stopLoss:   stopLossPrice,
+        takeProfit: takeProfitPrice,
+        comment:    mt5Comment,
+      };
+      const isPending = orderType.includes("LIMIT") || orderType.includes("STOP");
+      const expirationEpoch = isPending ? buildOrderExpiration(DECISION_VALIDITY_MINUTES) : undefined;
+      if (expirationEpoch !== undefined) orderPayload.expiration = expirationEpoch;
+
+      // 8. MODO DEMO POR DEFECTO (fail-safe de dinero real)
+      //    Sin LIVE_TRADING=true NADA sale hacia MT5: se calcula todo igual,
+      //    se registra con status "demo" y se responde con transparencia.
+      const liveTrading = process.env.LIVE_TRADING === "true";
+      if (!liveTrading) {
+        try {
+          saveOrder({
+            decisionId: gatedDecisionId,
+            symbol,
+            direction,
+            orderType,
+            volume: lotSize,
+            entryPrice,
+            stopLoss: stopLossPrice,
+            takeProfit: takeProfitPrice,
+            riskPct: boundRiskPct,
+            status: "demo",
+          });
+        } catch (dbErr) {
+          console.warn(`[ExecuteMT5] No se pudo registrar la orden demo en trade_orders: ${(dbErr as Error).message}`);
+        }
+
+        const slSource = DEFAULT_SL_PIPS[symbol] ? `(default ${DEFAULT_SL_PIPS[symbol]})` : "";
+        return [
+          `**[DEMO] Orden simulada (NO enviada a MT5). Configura LIVE_TRADING=true para operar en real.**`,
+          ``,
+          `### 🧪 Orden ${orderType} simulada — ${symbol}`,
+          `| Campo | Valor |`,
+          `|---|---|`,
+          `| **Balance** | $${balance.toFixed(2)} ${account.currency} |`,
+          `| **Lote** | ${lotSize} (crudo ${sizing.rawLotSize.toFixed(4)} → round-down a volume_step${symbolInfo ? ` ${symbolInfo.volumeStep}` : ""}, máx ${MAX_LOT}) |`,
+          `| **Riesgo** | ${boundRiskPct}% → **$${realRisk.toFixed(2)} reales** (${pipValueStr} · ${stopLossPips} pips${slSource}) |`,
+          `| **Tipo** | ${orderType} |`,
+          `| **Precio Entrada** | ${entryPrice} |`,
+          `| **Stop Loss** | ${stopLossPrice} (${stopLossPips} pips) |`,
+          `| **Take Profit** | ${takeProfitPrice} (1:3 RR) |`,
+          `| **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |`,
+          `| **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |`,
+          `| **Ticket MT5** | — (demo, no enviado) |`,
+          `| **Servidor** | ${account.server} |`,
+        ].join("\n");
+      }
+
+      // 9. Enviar orden al bridge (si falla, liberar la decisión reclamada)
       let result;
       try {
-        result = await MT5Bridge.placeOrder({
-          symbol,
-          type:       orderType,
-          volume:     lotSize,
-          price:      entryPrice,
-          stopLoss:   stopLossPrice,
-          takeProfit: takeProfitPrice,
-          comment:    comment,
-        });
+        result = await MT5Bridge.placeOrder(orderPayload);
       } catch (orderErr) {
         if (gatedDecisionId) releaseDecision(gatedDecisionId);
         throw orderErr;
       }
 
-      // 7. Registrar la orden para el settlement (vínculo decisión ↔ orden)
+      // 10. Registrar la orden para el settlement (vínculo decisión ↔ orden)
       try {
         saveOrder({
           decisionId: gatedDecisionId,
@@ -281,12 +475,13 @@ export const executeTradeMT5: Tool = {
 |---|---|
 | **Símbolo** | ${symbol} |
 | **Balance** | $${balance.toFixed(2)} ${account.currency} |
-| **Lote** | ${lotSize} (máx permitido ${MAX_LOT}) |
-| **Riesgo** | ${boundRiskPct}% → **$${realRisk.toFixed(2)} reales** (${pipValue}$/pip/lote · ${stopLossPips} pips${slSource}) |
+| **Lote** | ${lotSize} (crudo ${sizing.rawLotSize.toFixed(4)} → round-down a volume_step${symbolInfo ? ` ${symbolInfo.volumeStep}` : ""}, máx ${MAX_LOT}) |
+| **Riesgo** | ${boundRiskPct}% → **$${realRisk.toFixed(2)} reales** (${pipValueStr} · ${stopLossPips} pips${slSource}) |
 | **Tipo** | ${orderType} |
 | **Precio Entrada** | ${entryPrice} |
 | **Stop Loss** | ${stopLossPrice} (${stopLossPips} pips) |
 | **Take Profit** | ${takeProfitPrice} (1:3 RR) |
+| **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |
 | **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |
 | **Ticket MT5** | #${result.ticket} |
 | **Servidor** | ${account.server} |

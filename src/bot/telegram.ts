@@ -8,9 +8,30 @@ import path from "path";
 import fs from "fs";
 import { runAgentLoop } from "../agent/loop.js";
 import { upsertUser } from "../database/sqlite.js";
+import { MODEL_TIERS } from "../config/nvidia.js";
 import dotenv from "dotenv";
 
 dotenv.config({ override: true }); // override: el .env del proyecto gana sobre variables del sistema
+
+// ── Modo operativo (compliance Task 8-b) ──────────────────
+// DEMO por defecto; LIVE solo con opt-in explícito LIVE_TRADING=true.
+const TRADING_MODE =
+  (process.env.LIVE_TRADING ?? "").trim().toLowerCase() === "true" ? "LIVE" : "DEMO";
+const MODE_BADGE = TRADING_MODE === "LIVE" ? "🔴 [LIVE]" : "🟢 [DEMO]";
+
+/**
+ * Línea corta de riesgo que acompaña a toda notificación de orden ejecutada
+ * (compliance: disclaimer tras ejecución, auditoría 6-c).
+ */
+const TRADE_RISK_LINE =
+  "\n\n⚠️ _Operaste en los mercados con riesgo de pérdida total de tu capital. Verifica la orden en tu MT5 y gestiona tu tamaño._";
+
+/** Detecta la respuesta del tool de ejecución dentro del texto del agente. */
+const TRADE_EXECUTED_RE = /Orden .*Ejecutada en MT5|Ticket MT5/i;
+
+function withRiskDisclaimer(text: string): string {
+  return TRADE_EXECUTED_RE.test(text) ? `${text}${TRADE_RISK_LINE}` : text;
+}
 
 // ── Env validation ─────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -63,8 +84,13 @@ bot.use(async (ctx: Context, next) => {
 // ── /start command ─────────────────────────────────────────
 bot.command("start", async (ctx) => {
   await ctx.reply(
-    `👋 *Hola, soy tu Agente Conversacional.*\n\n` +
-      `Tu asistente de IA de élite, impulsado por *Kimi K2.5* vía NVIDIA NIM.\n\n` +
+    `${MODE_BADGE} 👋 *Hola, soy tu Agente de Trading SMC.*\n\n` +
+      `Escritorio de análisis institucional Smart Money Concepts con pipeline auditado, ` +
+      `impulsado por NVIDIA NIM (deep: \`${MODEL_TIERS.deep}\` · quick: \`${MODEL_TIERS.quick}\`).\n\n` +
+      `⚠️ *Disclaimer obligatorio:*\n` +
+      `• Soy una *herramienta educativa y de análisis*. *No* doy asesoría financiera ni recomendaciones de inversión.\n` +
+      `• Operar mercados apalancados conlleva un *riesgo elevado*: puedes perder *la totalidad de tu capital*.\n` +
+      `• Por defecto opero en *DEMO* (sin órdenes reales). Pasar a LIVE con \`LIVE_TRADING=true\` es bajo tu única responsabilidad.\n\n` +
       `Puedes escribirme cualquier cosa o enviarme una nota de voz. ¡Estoy listo!`,
     { parse_mode: "Markdown" }
   );
@@ -109,7 +135,8 @@ bot.on("message:text", async (ctx) => {
       userMessage: text,
     });
 
-    await ctx.reply(result.response, { parse_mode: "Markdown" });
+    // Compliance: si la respuesta notifica una orden ejecutada, añade la línea de riesgo.
+    await ctx.reply(withRiskDisclaimer(result.response), { parse_mode: "Markdown" });
     console.log(
       `[Bot] ✉️  User ${userId} → ${result.iterations} iterations → replied`
     );
@@ -168,7 +195,8 @@ bot.on("message:voice", async (ctx) => {
     // Clean up temp file
     fs.unlinkSync(localPath);
 
-    await ctx.reply(`🎤 *Transcripción:* ${transcription}\n\n${result.response}`, {
+    // Compliance: misma línea de riesgo que en texto (respuesta puede notificar una orden).
+    await ctx.reply(withRiskDisclaimer(`🎤 *Transcripción:* ${transcription}\n\n${result.response}`), {
       parse_mode: "Markdown",
     });
   } catch (err) {

@@ -127,10 +127,34 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Vista Cerebro (observabilidad + evaluación) ──────────────
   const chatWrapper = document.getElementById('chat-wrapper');
   const brainView = document.getElementById('brain-view');
+  const trackRecordView = document.getElementById('trackrecord-view');
   const inputArea = document.getElementById('input-area');
   const viewTitle = document.getElementById('view-title');
   const viewSubtitle = document.getElementById('view-subtitle');
+  const modeBadge = document.getElementById('mode-badge');
   let brainLoaded = false;
+  let trackRecordLoaded = false;
+
+  // ── Badge de modo [DEMO]/[LIVE] (Task 8-b) ──
+  function setModeBadge(mode) {
+    if (!modeBadge || !mode) return;
+    const m = String(mode).toUpperCase() === 'LIVE' ? 'LIVE' : 'DEMO';
+    modeBadge.textContent = m;
+    modeBadge.classList.toggle('live', m === 'LIVE');
+    modeBadge.classList.toggle('demo', m !== 'LIVE');
+    modeBadge.title = m === 'LIVE'
+      ? 'Modo LIVE: las órdenes se ejecutan en tu cuenta MT5 real'
+      : 'Modo operativo: DEMO no ejecuta órdenes reales';
+  }
+
+  // Prioridad: window.TRADING_MODE (inyectado) → /api/agent/status (campo mode)
+  if (window.TRADING_MODE) {
+    setModeBadge(window.TRADING_MODE);
+  } else {
+    fetch('/api/agent/status').then((r) => r.json())
+      .then((s) => setModeBadge(s.mode))
+      .catch(() => { /* badge queda en DEMO por defecto */ });
+  }
 
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', (e) => {
@@ -140,17 +164,27 @@ document.addEventListener('DOMContentLoaded', () => {
       const view = item.dataset.view;
       if (view === 'brain') {
         chatWrapper.hidden = true;
+        trackRecordView.hidden = true;
         brainView.hidden = false;
         inputArea.style.display = 'none';
-        viewTitle.textContent = 'Centro de Mando del Agente';
+        viewTitle.firstChild.textContent = 'Centro de Mando del Agente';
         viewSubtitle.textContent = 'Observabilidad en vivo · Pipeline SOP v3.1 · Auto-mejora';
         if (!brainLoaded) loadBrainView().catch(console.error);
+      } else if (view === 'trackrecord') {
+        chatWrapper.hidden = true;
+        brainView.hidden = true;
+        trackRecordView.hidden = false;
+        inputArea.style.display = 'none';
+        viewTitle.firstChild.textContent = 'Track Record ';
+        viewSubtitle.textContent = 'Historial auditado · "el único bot que te demuestra por qué NO operó" · no es una promesa de rentabilidad';
+        if (!trackRecordLoaded) loadTrackRecordView().catch(console.error);
       } else {
         brainView.hidden = true;
+        trackRecordView.hidden = true;
         chatWrapper.hidden = false;
         inputArea.style.display = '';
-        viewTitle.textContent = 'Analista Senior SMC';
-        viewSubtitle.textContent = 'Conectado a MetaApi | Nvidia NIM 120b';
+        viewTitle.firstChild.textContent = 'Analista Senior SMC';
+        viewSubtitle.textContent = 'Bridge MT5 local (bridge.py) | NVIDIA NIM: nemotron-3-super-120b-a12b + llama-3.3-70b-instruct';
       }
     });
   });
@@ -232,5 +266,105 @@ document.addEventListener('DOMContentLoaded', () => {
         <div><span>Latencia media</span><b>${(st.latency.avgMs / 1000).toFixed(1)}s</b></div>
       </div>
       <p class="muted demo-note">Vista demo con datos de ejemplo. En producción estos números salen de decision_log / agent_lessons en tiempo real.</p>`;
+  }
+
+  // ── Vista Track Record (Task 8-b: la vitrina pública) ─────────────
+  function fmtPct(v) {
+    return v === null || v === undefined ? '—' : (v * 100).toFixed(0) + '%';
+  }
+  function fmtPnl(v) {
+    return v === null || v === undefined ? '—' : (v >= 0 ? '+' : '') + v;
+  }
+
+  async function loadTrackRecordView() {
+    const container = document.getElementById('trackrecord-content');
+    let tr;
+    try {
+      const resp = await fetch('/api/trackrecord');
+      tr = await resp.json();
+    } catch (err) {
+      container.innerHTML = `<div class="glass-panel brain-card"><div class="tr-vacio">No se pudo cargar el Track Record (${err.message}).</div></div>`;
+      trackRecordLoaded = true;
+      return;
+    }
+    trackRecordLoaded = true;
+    if (tr && tr.demo) setModeBadge('DEMO');
+
+    const empty = !tr.totalDecisiones;
+    if (empty) {
+      container.innerHTML = `
+        <div class="glass-panel brain-card wide">
+          <h3>🏆 Track Record</h3>
+          <div class="tr-vacio">
+            Aún no hay decisiones auditadas.<br>
+            Cuando el agente ejecute su primer pipeline SMC, aquí verás su win rate, expectancy
+            y el <b>top 5 de "por qué NO operó"</b> — cada WAIT/REVIEW queda auditado con su motivo.
+          </div>
+        </div>`;
+      return;
+    }
+
+    const wrClass = tr.winRate === null ? '' : (tr.winRate >= 0.5 ? 'pos' : 'neg');
+    const expClass = tr.expectancyPct === null ? '' : (tr.expectancyPct >= 0 ? 'pos' : 'neg');
+    const racha = tr.rachaActual === 0 ? '—' : (tr.rachaActual > 0 ? `+${tr.rachaActual} ✅` : `${tr.rachaActual} ❌`);
+
+    const spark = (tr.serieTemporal || []);
+    const maxAbs = Math.max(1, ...spark.map((p) => Math.abs(p.pnlAcumulado)));
+    const sparkHtml = spark.length
+      ? `<div class="tr-spark">${spark.slice(-40).map((p) =>
+          `<i class="${p.pnlAcumulado < 0 ? 'down' : ''}" style="height:${Math.max(4, (Math.abs(p.pnlAcumulado) / maxAbs) * 44)}px" title="${p.fecha}: ${fmtPnl(p.pnlAcumulado)} acumulado"></i>`).join('')}</div>`
+      : '';
+
+    const razones = (tr.topRazonesEspera || []);
+    const razonesHtml = razones.length
+      ? `<ul class="tr-razones">${razones.map((r) =>
+          `<li><span>${r.razon}</span><span class="conteo">×${r.conteo}</span></li>`).join('')}</ul>`
+      : '<div class="tr-vacio">Sin esperas auditadas todavía.</div>';
+
+    const symbols = (tr.symbols || []).slice(0, 12);
+    const tablaHtml = symbols.length
+      ? `<table class="tr-tabla">
+          <thead><tr><th>Símbolo</th><th class="num">Decisiones</th><th class="num">Ejecutadas</th><th class="num">Cerradas</th><th class="num">W/L</th><th class="num">Win rate</th><th class="num">PnL acum.</th></tr></thead>
+          <tbody>${symbols.map((s) =>
+            `<tr><td><b>${s.symbol}</b></td><td class="num">${s.decisiones}</td><td class="num">${s.ejecutadas}</td><td class="num">${s.settled}</td><td class="num">${s.wins}/${s.losses}</td><td class="num">${fmtPct(s.winRate)}</td><td class="num ${s.pnl >= 0 ? 'pos' : 'neg'}">${fmtPnl(s.pnl)}</td></tr>`).join('')}</tbody>
+        </table>`
+      : '<div class="tr-vacio">Sin símbolos todavía.</div>';
+
+    container.innerHTML = `
+      <div class="tr-grid">
+        <div class="tr-card"><span>Win rate (cerradas)</span><b class="${wrClass}">${fmtPct(tr.winRate)}</b></div>
+        <div class="tr-card"><span>Expectancy media</span><b class="${expClass}">${tr.expectancyPct === null ? '—' : fmtPnl(tr.expectancyPct)}</b></div>
+        <div class="tr-card"><span>Decisiones totales</span><b>${tr.totalDecisiones}</b></div>
+        <div class="tr-card"><span>Racha actual</span><b>${racha}</b></div>
+      </div>
+      <div class="brain-grid">
+        <div class="glass-panel brain-card">
+          <h3>🚦 Por qué NO operó — top motivos de espera</h3>
+          ${razonesHtml}
+        </div>
+        <div class="glass-panel brain-card">
+          <h3>📊 Resumen por acción</h3>
+          <div class="stats-grid">
+            <div><span>🚀 EXECUTE</span><b>${tr.porAccion.EXECUTE ?? 0}</b></div>
+            <div><span>⏳ WAIT</span><b>${tr.porAccion.WAIT ?? 0}</b></div>
+            <div><span>🔍 REVIEW</span><b>${tr.porAccion.REVIEW ?? 0}</b></div>
+            <div><span>🛑 ABORTED</span><b>${tr.porAccion.ABORTED ?? 0}</b></div>
+            <div><span>Cerradas (W/L)</span><b>${tr.settledConPnl} (${tr.wins}/${tr.losses})</b></div>
+            <div><span>PnL acumulado</span><b class="${tr.totalPnl >= 0 ? 'pos' : 'neg'}">${fmtPnl(tr.totalPnl)}</b></div>
+            <div><span>Mejor símbolo</span><b class="pos">${tr.mejorSimbolo ? `${tr.mejorSimbolo.symbol} (${fmtPnl(tr.mejorSimbolo.pnl)})` : '—'}</b></div>
+            <div><span>Peor símbolo</span><b class="neg">${tr.peorSimbolo ? `${tr.peorSimbolo.symbol} (${fmtPnl(tr.peorSimbolo.pnl)})` : '—'}</b></div>
+          </div>
+          ${sparkHtml}
+        </div>
+        <div class="glass-panel brain-card wide">
+          <h3>🗂️ Detalle por símbolo</h3>
+          ${tablaHtml}
+        </div>
+      </div>
+      <p class="muted demo-note">
+        ${tr.demo ? 'Datos de DEMOSTRACIÓN (modo preview).' : 'Datos reales de decision_log.'}
+        ${tr.ultimoBrainScore !== null && tr.ultimoBrainScore !== undefined ? `Brain Score actual: ${tr.ultimoBrainScore}/100.` : ''}
+        Historial descriptivo y educativo: <b>no constituye una promesa ni proyección de rentabilidad futura</b>.
+      </p>`;
   }
 });

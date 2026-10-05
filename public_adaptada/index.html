@@ -6,9 +6,51 @@
   <title>Analista Trading Institucional | SMC AI</title>
   
   <link rel="stylesheet" href="style.css">
-  
+
   <!-- Markdown Parser (local, sin CDN) -->
   <script src="marked.min.js"></script>
+
+  <!-- Compliance Task 8-b: badge de modo + Track Record + footer (CSS mínimo inline) -->
+  <style>
+    body { padding-bottom: 30px; }
+    .mode-badge {
+      display: inline-block; margin-left: 10px; padding: 2px 10px;
+      border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .5px;
+      vertical-align: middle;
+    }
+    .mode-badge.demo { background: rgba(16, 185, 129, 0.15); color: #2dd4a7; border: 1px solid rgba(16,185,129,.35); }
+    .mode-badge.live { background: rgba(224, 92, 92, 0.15); color: #ff8f8f; border: 1px solid rgba(224,92,92,.4); animation: pulse 2s infinite; }
+    .disclaimer-footer {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
+      background: rgba(11, 15, 25, 0.92); backdrop-filter: blur(8px);
+      border-top: 1px solid var(--glass-border);
+      color: var(--text-secondary); font-size: 10.5px; line-height: 1.3;
+      text-align: center; padding: 7px 16px;
+    }
+    .disclaimer-footer strong { color: var(--text-primary); }
+    .tr-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .tr-card { background: rgba(255,255,255,.04); border-radius: 12px; padding: 14px 16px; }
+    .tr-card span { display: block; font-size: 11px; opacity: .6; margin-bottom: 6px; }
+    .tr-card b { font-size: 22px; font-weight: 800; }
+    .tr-card b.pos { color: #2dd4a7; }
+    .tr-card b.neg { color: #e05c5c; }
+    .tr-razones { list-style: none; margin: 0; padding: 0; }
+    .tr-razones li {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,.07); font-size: 13px;
+    }
+    .tr-razones li:last-child { border-bottom: none; }
+    .tr-razones .conteo { color: var(--accent-color); font-weight: 700; white-space: nowrap; }
+    .tr-tabla { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .tr-tabla th, .tr-tabla td { text-align: left; padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,.06); }
+    .tr-tabla th { opacity: .55; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+    .tr-tabla td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .tr-vacio { padding: 26px 8px; text-align: center; opacity: .65; font-size: 13px; line-height: 1.7; }
+    .tr-spark { display: flex; align-items: flex-end; gap: 3px; height: 44px; margin-top: 8px; }
+    .tr-spark i { flex: 1; min-height: 3px; border-radius: 2px 2px 0 0; background: linear-gradient(180deg, #4f8cff, #2dd4a7); }
+    .tr-spark i.down { background: linear-gradient(180deg, #e05c5c, #7a2f2f); }
+    @media (max-width: 900px) { .tr-grid { grid-template-columns: repeat(2, 1fr); } }
+  </style>
 </head>
 <body>
   <div class="app-container">
@@ -27,6 +69,9 @@
         <a href="#" class="nav-item" id="nav-brain" data-view="brain">
           <i class="icon">🧠</i> Cerebro
         </a>
+        <a href="#" class="nav-item" id="nav-trackrecord" data-view="trackrecord">
+          <i class="icon">🏆</i> Track Record
+        </a>
         <a href="#" class="nav-item" id="nav-performance" data-view="brain">
           <i class="icon">📈</i> Performance
         </a>
@@ -44,8 +89,8 @@
       <!-- Topbar -->
       <header class="topbar">
         <div class="topbar-info">
-          <h2 id="view-title">Analista Senior SMC</h2>
-          <p id="view-subtitle">Conectado a MetaApi | Nvidia NIM 120b</p>
+          <h2 id="view-title">Analista Senior SMC<span id="mode-badge" class="mode-badge demo" title="Modo operativo: DEMO no ejecuta órdenes reales">DEMO</span></h2>
+          <p id="view-subtitle">Bridge MT5 local (bridge.py) | NVIDIA NIM: nemotron-3-super-120b-a12b + llama-3.3-70b-instruct</p>
         </div>
       </header>
 
@@ -86,6 +131,11 @@
         </div>
       </div>
 
+      <!-- Vista Track Record (Task 8-b: la vitrina del producto) -->
+      <div class="chat-wrapper brain-view" id="trackrecord-view" hidden>
+        <div id="trackrecord-content"></div>
+      </div>
+
       <!-- Settings / Reasoning View (Hidden by default) -->
       <div id="reasoning-modal" class="modal glass-panel">
         <div class="modal-header">
@@ -108,7 +158,13 @@
     </main>
     
   </div>
-  
+
+  <!-- Compliance: footer fijo permanente (auditoría 6-c) -->
+  <footer class="disclaimer-footer">
+    <strong>Herramienta educativa y de análisis — no es asesoría financiera.</strong>
+    Operar apalancado puede suponer la <strong>pérdida total de tu capital</strong>. Resultados pasados no garantizan resultados futuros. Modo DEMO por defecto.
+  </footer>
+
   <script src="app.js"></script>
 </body>
 </html>

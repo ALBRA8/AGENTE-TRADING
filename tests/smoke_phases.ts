@@ -13,6 +13,8 @@ const { getAgentStatus } = await import("../src/agent/observability.js");
 const { checkNews } = await import("../src/agent/tools/check_news.js");
 const { checkDXY } = await import("../src/agent/tools/check_dxy.js");
 const { checkMarketHours } = await import("../src/agent/tools/check_market_hours.js");
+const { buildTrackRecord, getTrackRecord } = await import("../src/agent/trackrecord.js");
+const { generateLicenseKey, validateLicense } = await import("../src/license.js");
 
 import fs from "node:fs";
 
@@ -152,6 +154,91 @@ async function main() {
     return s;
   });
   assert(lockProbe.details.some((d: string) => d.includes("lock")), "lock anti-duplicado: settlement concurrente se omite");
+
+  // ── 11. TRACK RECORD (Task 8-b): buildTrackRecord PURA con filas fake ──
+  const fakeRows = [
+    { created_at: "2026-01-01 10:00:00", symbol: "US30", final_action: "WAIT", reasoning: "Fuera de killzone NY", gates_json: null, outcome_pnl: null, outcome_settled: 0 },
+    { created_at: "2026-01-02 10:00:00", symbol: "NAS100", final_action: "WAIT", reasoning: "Fuera de killzone NY", gates_json: null, outcome_pnl: null, outcome_settled: 0 },
+    { created_at: "2026-01-03 10:00:00", symbol: "NAS100", final_action: "WAIT", reasoning: "Sin BOS en M15", gates_json: null, outcome_pnl: null, outcome_settled: 0 },
+    { created_at: "2026-01-04 10:00:00", symbol: "US30", final_action: "EXECUTE", reasoning: null, gates_json: null, outcome_pnl: 100, outcome_settled: 1 },
+    { created_at: "2026-01-05 10:00:00", symbol: "XAUUSD", final_action: "EXECUTE", reasoning: null, gates_json: null, outcome_pnl: -50, outcome_settled: 1 },
+    { created_at: "2026-01-06 10:00:00", symbol: "XAUUSD", final_action: "EXECUTE", reasoning: null, gates_json: null, outcome_pnl: 30, outcome_settled: 1 },
+    { created_at: "2026-01-07 10:00:00", symbol: "BTCUSD", final_action: "ABORTED", reasoning: "Abortado por gate rojo: news", gates_json: null, outcome_pnl: null, outcome_settled: 0 },
+  ];
+  const tr = buildTrackRecord(fakeRows, [{ created_at: "2026-01-07 11:00:00", score: 71.5 }]);
+  assert(tr.totalDecisiones === 7 && tr.demo === false,
+    `trackrecord: total y etiqueta demo:false (got total=${tr.totalDecisiones}, demo=${tr.demo})`);
+  assert(tr.porAccion.EXECUTE === 3 && tr.porAccion.WAIT === 3 && tr.porAccion.ABORTED === 1 && tr.porAccion.REVIEW === 0,
+    "trackrecord: porAcción correcta (3E/3W/0R/1A)");
+  assert(tr.settledConPnl === 3 && tr.wins === 2 && tr.losses === 1,
+    "trackrecord: settled/wins/losses correctos");
+  assert(tr.winRate !== null && Math.abs((tr.winRate ?? 0) - 2 / 3) < 1e-3,
+    `trackrecord: win rate 2/3 redondeado a 4 decimales (got ${tr.winRate})`);
+  assert(tr.expectancyPct === 26.67 && tr.totalPnl === 80,
+    `trackrecord: expectancy (100-50+30)/3=26.67 y PnL total 80 (got ${tr.expectancyPct}/${tr.totalPnl})`);
+  assert(tr.mejorSimbolo?.symbol === "US30" && tr.peorSimbolo?.symbol === "XAUUSD",
+    `trackrecord: mejor/peor símbolo por PnL (got ${tr.mejorSimbolo?.symbol}/${tr.peorSimbolo?.symbol})`);
+  assert(tr.rachaActual === 1,
+    `trackrecord: racha actual +1 (última cerrada ganadora, got ${tr.rachaActual})`);
+  assert(tr.topRazonesEspera.length === 2 && tr.topRazonesEspera[0].razon === "Fuera de killzone NY" && tr.topRazonesEspera[0].conteo === 2 && tr.topRazonesEspera[1].razon === "Sin BOS en M15",
+    "trackrecord: razones de espera ordenadas por conteo (2x killzone, 1x BOS)");
+  assert(tr.serieTemporal.length === 3 && tr.serieTemporal[2].pnlAcumulado === 80,
+    "trackrecord: serie temporal acumulada (3 fechas, cierre en 80)");
+  assert(tr.ultimoBrainScore === 71.5,
+    `trackrecord: brain score más reciente (got ${tr.ultimoBrainScore})`);
+
+  // Fallback: WAIT sin reasoning → motivo desde gates_json (primer gate no-GREEN)
+  const trGates = buildTrackRecord([
+    { created_at: "2026-02-01 10:00:00", symbol: "US30", final_action: "WAIT", reasoning: null,
+      gates_json: JSON.stringify([{ name: "market_hours", status: "YELLOW", detail: "Fuera de killzone principal" }]),
+      outcome_pnl: null, outcome_settled: 0 },
+  ]);
+  assert(trGates.topRazonesEspera[0]?.razon.includes("market_hours") === true,
+    `trackrecord: fallback a gates_json cuando reasoning vacío (got "${trGates.topRazonesEspera[0]?.razon}")`);
+
+  // DB vacía → estructura válida con ceros, sin throw
+  const trEmpty = buildTrackRecord([], []);
+  assert(
+    trEmpty.totalDecisiones === 0 && trEmpty.winRate === null && trEmpty.expectancyPct === null &&
+    trEmpty.serieTemporal.length === 0 && trEmpty.topRazonesEspera.length === 0 &&
+    Array.isArray(trEmpty.symbols) && trEmpty.mejorSimbolo === null,
+    "trackrecord: DB vacía → ceros/nulls sin throw"
+  );
+
+  // getTrackRecord sobre la DB real del smoke test (sin PII)
+  saveDecision({ symbol: "EURTEST", finalAction: "WAIT", confidence: 0.5, reasoning: "Fuera de killzone NY" });
+  const trDb = getTrackRecord();
+  assert(trDb.demo === false && trDb.totalDecisiones === 8,
+    `getTrackRecord: lee decision_log real (8 decisiones, got ${trDb.totalDecisiones})`);
+  assert(trDb.winRate === 1 && trDb.expectancyPct === 145.5,
+    `getTrackRecord: 1 settled win → winRate 1.0 y expectancy 145.5 (got ${trDb.winRate}/${trDb.expectancyPct})`);
+  assert(trDb.topRazonesEspera.length >= 1 && trDb.topRazonesEspera[0].razon.includes("killzone"),
+    `getTrackRecord: motivo real de WAIT extraído ("${trDb.topRazonesEspera[0]?.razon}")`);
+  const trDump = JSON.stringify(trDb);
+  assert(!trDump.includes("user_id") && !trDump.includes("web_session") && !trDump.includes("@"),
+    "getTrackRecord: SIN PII (ni user_id, ni sesiones, ni emails)");
+
+  // ── 12. LICENCIA OFFLINE (Task 8-b): generate + validate ──
+  const SECRET = "smoke-license-secret";
+  const keyOk = generateLicenseKey("Owner@Example.com", 30, SECRET);
+  const resOk = validateLicense(keyOk, SECRET);
+  assert(resOk.valid === true && resOk.email === "owner@example.com" && (resOk.daysLeft ?? 0) >= 29 && (resOk.daysLeft ?? 0) <= 30,
+    `licencia: generate→validate redonda OK (email=${resOk.email}, daysLeft=${resOk.daysLeft})`);
+  assert(validateLicense(keyOk.slice(0, -3) + "aaa", SECRET).valid === false,
+    "licencia: key manipulada → inválida");
+  const wrongSecret = validateLicense(keyOk, "otro-secreto");
+  assert(wrongSecret.valid === false && wrongSecret.reason === "firma_invalida",
+    `licencia: secreto distinto → firma_invalida (got ${wrongSecret.reason})`);
+  const expired = validateLicense(generateLicenseKey("expired@example.com", -1, SECRET), SECRET);
+  assert(expired.valid === false && expired.reason === "expirada",
+    `licencia: expirada detectada (got ${expired.reason}, daysLeft=${expired.daysLeft})`);
+  assert(validateLicense("basura-no-es-una-key", SECRET).reason === "formato_invalido",
+    "licencia: formato basura → formato_invalido");
+  assert(validateLicense(keyOk, "").valid === false,
+    "licencia: sin secreto → no valida (nunca true por defecto)");
+  const keyYear = validateLicense(generateLicenseKey("trader@test.io", 365, SECRET), SECRET);
+  assert(keyYear.valid === true && (keyYear.daysLeft ?? 0) >= 364,
+    `licencia: roundtrip 365 días (daysLeft=${keyYear.daysLeft})`);
 
   fs.writeSync(1, "\n🧪 Smoke test completo.\n");
   try { db.close(); } catch {}

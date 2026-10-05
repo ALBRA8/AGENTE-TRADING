@@ -1,0 +1,43 @@
+# CI de AGENTE-TRADING (Task 8-b)
+#
+# - npm test: smoke suite (plomería DB, hard-gate one-shot, datos honestos,
+#   settlement, track record, licencia offline). Sin API keys reales.
+# - Typecheck con BASELINE TEMPORAL: hoy `npx tsc --noEmit` produce 76 errores
+#   PRE-EXISTENTES, todos en src/backtest/** y src/agent/tools/run_backtest_pro.ts
+#   (módulo legacy no tocado por las Fases 0-5 ni por Task 8-b). El gate falla
+#   solo si el total SUBE por encima de 76 — así el código nuevo queda obligado
+#   a estar limpio sin bloquear por el deuda técnica del backtest. Cuando se
+#   arregle src/backtest/, bajar este número a 0 y eliminar el baseline.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Tests (smoke suite)
+        run: npm test
+
+      # Baseline temporal: 76 errores pre-existentes en src/backtest/**.
+      # NO subir este número; la meta es bajarlo a 0 (ver comentario arriba).
+      - name: Typecheck (baseline temporal backtest/)
+        run: |
+          npx tsc --noEmit 2>&1 | tee tsc.log
+          ERRORES=$(grep -c "error TS" tsc.log || true)
+          echo "Errores TS detectados: $ERRORES (baseline permitido: 76)"
+          test "$ERRORES" -le 76

@@ -1,21 +1,37 @@
 import type { Tool } from "../types.js";
 import { MT5Bridge } from "../../config/mt5bridge.js";
+import { analyzeLiveStructure } from "../../smc/live.js";
 
 /**
- * Interface for Market Analysis parameters
+ * Task 8-a — Reescritura completa (auditoría 6-a / C2):
+ *  - ANTES: macroTrend, BOS, ChoCh y "ChoCh Confirmado en M1" estaban
+ *    HARDCODEADOS: el pipeline debatía sobre estructura inventada.
+ *  - AHORA: toda la estructura sale del detector SMC real
+ *    (src/backtest/smc_detector.ts) ejecutado sobre velas REALES del
+ *    bridge (src/smc/live.ts). Sin datos → reporte honesto
+ *    "DATOS NO DISPONIBLES" sin sugerir ejecución (fail-closed).
+ *  - Killzone NY con timezone real America/New_York (DST-safe): misma
+ *    técnica que check_market_hours.ts — se replica aquí porque ese
+ *    archivo no exporta helpers y está fuera del alcance de esta tarea.
  */
+
 interface AnalyzeMarketArgs {
   timeframe: "H1" | "M15" | "M5" | "M1";
   asset?: string;
 }
 
-function getDynamicSL(asset: string): number {
-  if (asset === "US30") return 15;
-  if (asset === "NAS100") return 20;
-  if (asset === "XAUUSD") return 30;
-  if (asset === "GBPJPY") return 20;
-  if (asset === "BTCUSD" || asset === "BITCOIN") return 500; // 500 puntos ($500 de movimiento)
-  return 15;
+/** Hora y día de Nueva York con timezone real (corrige el offset fijo -5) */
+function getNYClock(): { hour: number; weekday: string } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    hour12: false,
+    weekday: "short",
+  }).formatToParts(new Date());
+  return {
+    hour: parseInt(parts.find((p) => p.type === "hour")?.value ?? "0", 10) % 24,
+    weekday: parts.find((p) => p.type === "weekday")?.value ?? "",
+  };
 }
 
 export const analyzeMarket: Tool = {
@@ -23,7 +39,7 @@ export const analyzeMarket: Tool = {
     type: "function",
     function: {
       name: "analyzeMarket",
-      description: "Realiza un análisis técnico SMC simulado (o real si el bridge está activo) para el activo seleccionado.",
+      description: "Análisis SMC EN VIVO del activo: detecta swings, BOS/ChoCh, FVGs y POIs con el detector real sobre las velas de MT5 (nada hardcodeado). Si el bridge no responde o faltan velas, devuelve DATOS NO DISPONIBLES sin sugerir ejecución.",
       parameters: {
         type: "object",
         properties: {
@@ -44,66 +60,64 @@ export const analyzeMarket: Tool = {
   },
 
   async execute(args: Record<string, unknown>): Promise<string> {
-    const { timeframe, asset = "US30" } = args as unknown as AnalyzeMarketArgs;
-    
-    // 1. Validar Killzone (NY: 8:00 AM - 12:00 PM EST)
-    const now = new Date();
-    const estOffset = -5;
-    const utcHour = now.getUTCHours();
-    const estHour = (utcHour + estOffset + 24) % 24;
+    const { timeframe = "M5", asset = "US30" } = args as unknown as AnalyzeMarketArgs;
+    const symbol = String(asset).trim().toUpperCase();
 
-    const isNYKillzone = estHour >= 8 && estHour <= 12;
-    const killzoneStatus = isNYKillzone 
-      ? "✅ DENTRO de Killzone de Nueva York." 
-      : "❌ FUERA de Killzone de Nueva York.";
+    // 1. Killzone NY — lógica DST-safe (idéntica criterio a check_market_hours)
+    const { hour: nyHour, weekday: nyWeekday } = getNYClock();
+    const isNYKillzone = nyHour >= 8 && nyHour < 12;
+    const isWeekend = nyWeekday === "Sat" || nyWeekday === "Sun";
 
-    // 2. Simulación de Análisis SMC
-    const isCrypto = asset === "BTCUSD" || asset === "BITCOIN";
-    const macroTrend = "ALCISTA (H1)";
-    const h1FVGDetected = true; 
-    
-    const structure = {
-      bos: "Detectado en M15 (Último máximo roto con cuerpo)",
-      choch: timeframe === "M1" 
-        ? "✅ ChoCh Confirmado en M1 (Cambio de carácter detectado tras toma de liquidez)"
-        : "Esperando ChoCh en temporalidades menores (M1/M5)",
-      poi: isCrypto 
-        ? `H1 FVG + M15 Order Block` 
-        : `M15 Order Block (Origen del BOS) + FVG (No mitigado)`
-    };
+    // 2. Estructura SMC REAL (detector de backtest sobre velas del bridge)
+    //    Cualquier fallo aquí es honesto: sin datos no hay análisis.
+    const analysis = await analyzeLiveStructure(symbol, timeframe);
 
-    const isChoChConfirmed = timeframe === "M1" && (!isCrypto || h1FVGDetected);
-    const dynamicSL = getDynamicSL(asset);
-    
-    const liquidity = "Toma de liquidez de la sesión de Londres finalizada.";
-    
-    let priceInfo: string;
-    try {
-        // Llamada ACTIVA al bridge de MetaTrader 5
-        const tick = await MT5Bridge.getPrice(asset);
-        
-        if (tick.bid === 0 || tick.ask === 0) {
-            priceInfo = `⚠️ **Error de Datos**: El símbolo '${asset}' devolvió precios en 0. Asegúrate de que esté visible en 'Market Watch' de MT5.`;
-        } else {
-            priceInfo = `Precio Actual (${tick.symbol}): Bid **${tick.bid}** | Ask **${tick.ask}** (Spread: ${tick.spread} pips)`;
-        }
-    } catch (e: any) {
-        priceInfo = `❌ **Error de Bridge**: No se pudo obtener el precio real de ${asset}. Detalle: ${e.message}`;
+    if (!analysis.available) {
+      const reason = analysis.unavailableReason ?? "motivo desconocido";
+      // Marcadores "Error de Bridge" / "Error de Datos": el pipeline los
+      // usa para poner el gate price_feed en UNKNOWN (fail-closed).
+      const isBridgeIssue = reason.toLowerCase().includes("bridge") || reason.toLowerCase().includes("timeout");
+      const header = isBridgeIssue ? "Error de Bridge" : "Error de Datos";
+      return [
+        `📊 **Reporte SMC — ${symbol} (${timeframe})**`,
+        `❌ **${header}**: ${reason}`,
+        ``,
+        `## ⛔ DATOS NO DISPONIBLES`,
+        `No se puede analizar la estructura de ${symbol} con datos reales, así que este reporte NO sugiere ejecución.`,
+        `El pipeline tratará el precio/estructura como UNKNOWN y bloqueará EXECUTE (fail-closed).`,
+        isBridgeIssue
+          ? `_Verifica que MT5 esté abierto y bridge.py corriendo en localhost:5001._`
+          : `_Datos insuficientes del feed: no se simulan ni se rellenan._`,
+      ].join("\n");
     }
 
-    // 4. Formatear Respuesta Simplificada
-    const decision = isChoChConfirmed ? "🚀 EJECUTAR" : "⏳ ESPERAR";
-    const report = `
-📊 **Reporte de Auditoría: ${asset}**
-• 💹 **Activo**: ${asset} (${timeframe})
-• 🛡️ **Filtros**:
-  ${isNYKillzone ? "🟢 Killzone NY" : "🔴 Fuera de Horario"}
-  ${isChoChConfirmed ? "🟢 ChoCh Confirmado" : "🟡 Esperando ChoCh"}
-  🟢 Macro: ${macroTrend}
-• 💰 **Datos MT5**: ${priceInfo}
-• 🎯 **Decisión**: ${decision}
-`.trim();
+    // 3. Tick en vivo (complementario, no crítico: ya hay cierre real de vela)
+    let tickLine = `Último cierre: **${analysis.lastPrice}** (${analysis.candleCount} velas hasta ${analysis.asOf})`;
+    try {
+      const tick = await MT5Bridge.getPrice(symbol);
+      if (Number.isFinite(tick.bid) && Number.isFinite(tick.ask) && tick.bid > 0 && tick.ask > 0) {
+        tickLine += ` · Bid **${tick.bid}** / Ask **${tick.ask}** (spread ${tick.spread})`;
+      }
+    } catch {
+      tickLine += ` · _tick en vivo no disponible (el análisis usa el cierre real de vela)_`;
+    }
 
-    return report;
+    // 4. Estado de sesión (informativo: el gate de horario decide en el pipeline)
+    const killzoneStr = isNYKillzone
+      ? "🟢 Killzone NY activa (8-12 NY, DST-safe)"
+      : `🔴/⚪ Fuera de killzone NY (${nyHour}:00 NY, ${nyWeekday})${isWeekend ? " · FIN DE SEMANA" : ""}`;
+
+    // 5. Reporte de estructura real (generado por smc/live con números reales)
+    const decisionLine = analysis.setupValid
+      ? "🟢 Setup válido según detector — la decisión (EXECUTE/WAIT) la toma el pipeline con sus gates y comité, NO este reporte."
+      : "🟡 Sin setup válido ahora — no hay base estructural para sugerir ejecución.";
+
+    return [
+      analysis.reportText,
+      "",
+      `🛡️ **Filtros de sesión**: ${killzoneStr}`,
+      `💰 **Precio**: ${tickLine}`,
+      `🎯 **Estado**: ${decisionLine}`,
+    ].join("\n");
   }
 };

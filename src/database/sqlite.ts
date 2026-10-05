@@ -175,6 +175,11 @@ db.exec(`
   if (!cols.includes("consumed_at")) {
     db.exec(`ALTER TABLE decision_log ADD COLUMN consumed_at TEXT`);
   }
+  // Task 8-a: marca temporal del SETTLE (necesaria para el PnL del día —
+  // sin ella no se puede distinguir un outcome cerrado HOY de uno histórico).
+  if (!cols.includes("outcome_timestamp")) {
+    db.exec(`ALTER TABLE decision_log ADD COLUMN outcome_timestamp TEXT`);
+  }
 })();
 
 // Índice único para dedupe real de lecciones (la dedupe por SELECT+INSERT
@@ -363,7 +368,7 @@ export function saveDecision(d: {
 
 export function updateDecisionOutcome(decisionId: number, pnl: number): void {
   db.prepare(
-    `UPDATE decision_log SET outcome_pnl = ?, outcome_settled = 1 WHERE id = ?`
+    `UPDATE decision_log SET outcome_pnl = ?, outcome_settled = 1, outcome_timestamp = datetime('now') WHERE id = ?`
   ).run(pnl, decisionId);
 }
 
@@ -744,6 +749,55 @@ export function markDecisionExpired(decisionId: number, source: string): void {
   db.prepare(
     `UPDATE decision_log SET outcome_settled = 2, outcome_source = ? WHERE id = ?`
   ).run(source, decisionId);
+}
+
+// ── Kill-switches de cuenta (Task 8-a) ─────────────────────
+// Fuentes deterministas para el gate account_risk de risk_controls.ts.
+// Convención temporal: UTC (datetime('now') de SQLite), igual que el
+// resto de la tabla (created_at).
+
+/**
+ * PnL REALIZADO de HOY: suma de outcome_pnl de decisiones SETTLED
+ * (outcome_settled = 1) cuyo outcome_timestamp cae en el día UTC actual.
+ * Los outcomes históricos sin timestamp (filas legacy previas a Task 8-a)
+ * NO se cuentan como hoy: atribuirlos al día actual sería inventar datos.
+ */
+export function getTodayRealizedPnl(): number {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(outcome_pnl), 0) AS pnl
+       FROM decision_log
+       WHERE outcome_settled = 1
+         AND outcome_pnl IS NOT NULL
+         AND outcome_timestamp IS NOT NULL
+         AND date(outcome_timestamp) = date('now')`
+    )
+    .get() as { pnl: number | null };
+  return Number(row.pnl) || 0;
+}
+
+/**
+ * Racha ACTUAL de pérdidas: recorre las decisiones SETTLED más recientes
+ * (por outcome_timestamp, tiebreak por id) contando pérdidas consecutivas;
+ * la primera decisión no-pérdida (pnl >= 0) corta la racha.
+ * Devuelve 0 si no hay historial settled.
+ */
+export function getConsecutiveLosses(): number {
+  const rows = db
+    .prepare(
+      `SELECT outcome_pnl
+       FROM decision_log
+       WHERE outcome_settled = 1
+         AND outcome_pnl IS NOT NULL
+       ORDER BY COALESCE(outcome_timestamp, created_at) DESC, id DESC`
+    )
+    .all() as Array<{ outcome_pnl: number }>;
+  let streak = 0;
+  for (const r of rows) {
+    if (r.outcome_pnl < 0) streak++;
+    else break;
+  }
+  return streak;
 }
 
 export default db;

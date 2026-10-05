@@ -1,0 +1,43 @@
+AGENTE-TRADING — Licencia de software propietario
+Copyright (c) 2026 El titular del repositorio AGENTE-TRADING. All rights reserved.
+
+1. PROPIEDAD
+   Este software, su código fuente, documentación y materiales asociados son
+   propiedad exclusiva de su autor. Todos los derechos reservados. No se
+   otorga ninguna licencia implícita por el mero acceso al repositorio.
+
+2. USO PERSONAL PERMITIDO
+   Se permite el uso personal de este software únicamente a quien lo haya
+   obtenido legítimamente, siempre que:
+   - No se distribuya, revenda, sublicencie ni publiquen copias del código
+     (total o parcial, compilado o fuente) a terceros.
+   - No se eliminen ni alteren los avisos de copyright, la licencia ni los
+     disclaimers de riesgo incluidos en la interfaz, Telegram o documentación.
+   - El uso se realice con fines educativos y de análisis sobre cuentas
+     propias (por defecto en modo DEMO).
+
+3. LICENCIA COMERCIAL
+   La comercialización del producto (modelo de licencia, precios y canales)
+   aún no está definida. [PLACEHOLDER: condiciones de la licencia comercial
+   por definir — ver docs/COMPLIANCE.md, sección "Checklist de lanzamiento".]
+   Hasta que ese placeholder se sustituya, queda PROHIBIDO cualquier uso
+   comercial de este software por terceros.
+
+4. ACTIVOS DE TERCEROS
+   Este software se integra con servicios y componentes de terceros (NVIDIA
+   NIM, Tavily, Telegram, MetaTrader 5) bajo sus propios términos. El
+   usuario es responsable de disponer de las credenciales y permisos
+   necesarios y de cumplir dichos términos.
+
+5. SIN GARANTÍA / RIESGO
+   EL SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍAS DE NINGÚN TIPO,
+   EXPRESAS O IMPLÍCITAS, INCLUIDAS —SIN LIMITACIÓN— LAS GARANTÍAS DE
+   COMERCIABILIDAD, APTITUD PARA UN FIN PARTICULAR Y NO INFRACCIÓN. EL
+   TRADING DE INSTRUMENTOS FINANCIEROS CONLLEVA UN RIESGO ELEVADO Y PUEDE
+   SUPONER LA PÉRDIDA TOTAL DEL CAPITAL. EL AUTOR NO ACONSEJA OPERACIONES
+   NI RESPONDE POR PÉRDIDAS DERIVADAS DEL USO DEL SOFTWARE.
+
+6. TERMINACIÓN
+   El incumplimiento de cualquiera de las cláusulas anteriores termina
+   automáticamente el permiso de uso, debiendo cesar su uso y eliminar
+   todas las copias.

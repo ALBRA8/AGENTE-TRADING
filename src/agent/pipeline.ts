@@ -24,6 +24,8 @@ import { executeToolByName } from "./registry.js";
 import { callLLMByTier } from "../config/nvidia.js";
 import { captureAutoError, buildLessonsContextBlock, extractJson } from "./self_improve.js";
 import { saveDecision } from "../database/sqlite.js";
+import { getAccountRisk } from "./risk_controls.js";
+import { MT5Bridge } from "../config/mt5bridge.js";
 
 // ── Tipos ───────────────────────────────────────────────────
 export type GateStatus = "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
@@ -71,7 +73,7 @@ interface PipelineOptions {
   onProgress?: (msg: string) => void;
 }
 
-// ── Utilidades ──────────────────────────────────────────────
+// ── Utilidades ──────────────────────────────────────────────────────────
 function coerceNumber(v: unknown): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string") {
@@ -97,6 +99,111 @@ async function runTool(
   } catch (err) {
     captureAutoError(name, err as Error, args);
     return `⚠️ Filtro ${name} no disponible: ${(err as Error).message}. Tratar dato como UNKNOWN, no inventar valores.`;
+  }
+}
+
+// ── Limpieza de pendientes obsoletos (Task 8-a, audit C5) ──
+// Las órdenes del agente llevan comment "AGT-<DIR>-<SIMBOLO>-<decisión>".
+// Una pendiente colocada hace >15 min está apoyada en una decisión
+// EXPIRADA: se cancela. Fallo de cancelación → log honesto, jamás tumba
+// el pipeline (la limpieza es best-effort, el gate es lo que bloquea).
+const PENDING_STALE_MS = 15 * 60 * 1000;
+
+/** Extrae {dir, symbol} de un comment "AGT-BUY-US30-42" (o null si no encaja) */
+function parseAgentOrderComment(comment: string): { dir: "BUY" | "SELL"; symbol: string } | null {
+  if (!comment.startsWith("AGT-")) return null;
+  const parts = comment.split("-");
+  const dir = parts[1]?.toUpperCase();
+  const symbol = parts[2]?.toUpperCase();
+  if ((dir === "BUY" || dir === "SELL") && symbol) return { dir, symbol };
+  return null;
+}
+
+async function cleanupStalePendingOrders(onProgress?: PipelineOptions["onProgress"]): Promise<string[]> {
+  const cancelled: string[] = [];
+  try {
+    const pendings = await MT5Bridge.getPendingOrders();
+    const now = Date.now();
+    for (const o of pendings) {
+      try {
+        if (!parseAgentOrderComment(String(o.comment ?? ""))) continue;
+        const placed = o.time ? Date.parse(o.time) : NaN;
+        if (!Number.isFinite(placed)) continue; // sin hora no hay evidencia para cancelar
+        if (now - placed <= PENDING_STALE_MS) continue;
+        const ok = await MT5Bridge.cancelOrder(o.ticket);
+        if (ok) {
+          cancelled.push(`#${o.ticket} ${o.symbol} (${o.comment}) — pendiente >15 min`);
+        } else {
+          console.warn(`[Pipeline] MT5 rechazó la cancelación del pendiente obsoleto #${o.ticket}`);
+        }
+      } catch (err) {
+        console.warn(`[Pipeline] No se pudo cancelar pendiente #${o.ticket}: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Pipeline] Limpieza de pendientes omitida (bridge no disponible): ${(err as Error).message}`);
+  }
+  if (cancelled.length) {
+    onProgress?.(`🧹 ${cancelled.length} pendiente(s) obsoleto(s) cancelado(s) en MT5`);
+  }
+  return cancelled;
+}
+
+/**
+ * Tras decidir un bias con dirección explícita, las pendientes del agente
+ * en dirección OPUESTA para el mismo símbolo quedan en contra de la
+ * decisión vigente (y su EXECUTE original ya quedó invalidado por la
+ * regla de decisión-más-reciente): se cancelan.
+ */
+async function cancelOppositePendings(symbol: string, direction: "BUY" | "SELL"): Promise<string[]> {
+  const cancelled: string[] = [];
+  try {
+    const pendings = await MT5Bridge.getPendingOrders();
+    for (const o of pendings) {
+      try {
+        const parsed = parseAgentOrderComment(String(o.comment ?? ""));
+        if (!parsed || parsed.symbol !== symbol || parsed.dir === direction) continue;
+        const ok = await MT5Bridge.cancelOrder(o.ticket);
+        if (ok) {
+          cancelled.push(`#${o.ticket} ${o.symbol} ${parsed.dir} — opuesta al bias ${direction}`);
+        } else {
+          console.warn(`[Pipeline] MT5 rechazó la cancelación del pendiente #${o.ticket}`);
+        }
+      } catch (err) {
+        console.warn(`[Pipeline] No se pudo cancelar pendiente #${o.ticket}: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Pipeline] Cancelación de pendientes opuestas omitida (bridge no disponible): ${(err as Error).message}`);
+  }
+  return cancelled;
+}
+
+// ── Gate account_risk (Task 8-a): kill-switches de cuenta ──
+// GREEN = límites respetados con datos verificables.
+// RED   = violación real O fuente parcial caída (fail-closed).
+// UNKNOWN = cuenta ilegible (bloquea EXECUTE igual que los demás).
+async function stageAccountRisk(): Promise<Gate> {
+  try {
+    const snap = await getAccountRisk();
+    if (!snap.evaluated) {
+      return gate(
+        "UNKNOWN",
+        "account_risk",
+        `Riesgo de cuenta NO evaluable: ${snap.violations.join(" · ") || "cuenta MT5 no disponible"}`
+      );
+    }
+    if (snap.ok) {
+      const d = snap.details;
+      return gate(
+        "GREEN",
+        "account_risk",
+        `Cuenta sana: ${d.openPositions}/${d.maxOpenPositions} posiciones · exposición ${d.totalExposureLots?.toFixed(2) ?? "0"}/${d.maxTotalExposureLots} lotes · PnL hoy ${d.dailyPnl?.toFixed(2) ?? "n/d"} (límite pérdida ${d.dailyLossLimitPct}%) · racha pérdidas ${d.consecutiveLosses}/${d.maxConsecutiveLosses}`
+      );
+    }
+    return gate("RED", "account_risk", `Kill-switch de cuenta: ${snap.violations.join(" · ")}`);
+  } catch (err) {
+    return gate("UNKNOWN", "account_risk", `No se pudo evaluar el riesgo de cuenta: ${(err as Error).message}`);
   }
 }
 
@@ -409,8 +516,15 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
   let tokens = 0;
 
   try {
-    // ── Etapa 1: analistas + gates ──
-    const { gates, reports } = await stageAnalysts(symbol, timeframe, opts.onProgress);
+    // ── Etapa 0: higiene de pendientes + riesgo de cuenta (sin tokens) ──
+    // La limpieza corre en paralelo con los filtros; su fallo jamás
+    // interrumpe el pipeline (solo deja el log honesto).
+    const [{ gates, reports }, accountGate] = await Promise.all([
+      stageAnalysts(symbol, timeframe, opts.onProgress),
+      stageAccountRisk(),
+    ]);
+    gates.push(accountGate);
+    void cleanupStalePendingOrders(opts.onProgress);
     const redGate = gates.find((g) => g.status === "RED");
 
     if (redGate) {
@@ -478,7 +592,7 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
     } else {
       // Fail-closed (SOP v3.2): UNKNOWN en filtros críticos JAMÁS permite EXECUTE.
       // Un dato faltante no es verde: es un hueco de información que bloquea.
-      const CRITICAL_GATES = ["market_hours", "news", "rvol", "price_feed"];
+      const CRITICAL_GATES = ["market_hours", "news", "rvol", "price_feed", "account_risk"];
       const criticalUnknown = gates.some(
         (g) => g.status === "UNKNOWN" && CRITICAL_GATES.includes(g.name)
       );
@@ -525,6 +639,14 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
       tokensUsed: tokens,
       latencyMs,
     });
+
+    // ── Flip de bias: pendientes del agente en dirección opuesta al bias
+    // decidido quedan anuladas (su EXECUTE original ya fue invalidado por
+    // la regla de decisión-más-reciente del hard-gate one-shot).
+    if (plan?.direction && (finalAction === "EXECUTE" || finalAction === "WAIT")) {
+      const opp = await cancelOppositePendings(symbol, plan.direction);
+      if (opp.length) opts.onProgress?.(`🧹 ${opp.length} pendiente(s) opuesta(s) al bias ${plan.direction} cancelada(s)`);
+    }
 
     const md = renderVerdict({
       symbol, timeframe, finalAction, gates, verdict, plan, opinions,
