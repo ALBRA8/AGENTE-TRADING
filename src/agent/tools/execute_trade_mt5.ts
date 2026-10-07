@@ -6,6 +6,7 @@ import {
   releaseDecision,
   saveOrder,
 } from "../../database/sqlite.js";
+import { assertExecutionForDecision } from "../policy.js";
 
 /**
  * Herramienta de ejecución de órdenes via MT5 local (sin MetaApi)
@@ -36,9 +37,13 @@ interface ExecuteTradeArgs {
   comment?: string;
 }
 
-// Escape de emergencia: PIPELINE_GATE=off desactiva el gate (SOLO debug local;
-// en producción debe mantenerse "on" — observability lo reporta como 🔴 OFF)
-const PIPELINE_GATE = (process.env.PIPELINE_GATE ?? "on").toLowerCase() !== "off";
+// PROMPT 06 §23: SIN BYPASS. El escape PIPELINE_GATE=off fue eliminado
+// (auditorías 9-e/9-h: era una puerta trasera de policy que anulaba el
+// one-shot y el binding de SL/riesgo). El hard-gate SIEMPRE está activo;
+// la variable solo se conserva para AVISAR que el escape fue solicitado
+// e ignorado. La única autoridad de bypass es el EXECUTION GUARD, que
+// re-valida todo dentro de MT5Bridge.placeOrder.
+const PIPELINE_GATE_ENV_OFF = (process.env.PIPELINE_GATE ?? "").toLowerCase() === "off";
 const MAX_RISK_PCT = Math.min(2, Math.max(0.1, parseFloat(process.env.MAX_RISK_PCT ?? "1.0")) || 1.0);
 const MAX_LOT = Math.max(0.01, parseFloat(process.env.MAX_LOT ?? "10")) || 10;
 /** Ventana de validez de la decisión EXECUTE (minutos) → expiración de la orden */
@@ -239,11 +244,15 @@ export const executeTradeMT5: Tool = {
     } = args as unknown as ExecuteTradeArgs;
     const symbol = String(rawSymbol).trim().toUpperCase();
 
-    // ── HARD-GATE (SOP v3.2, one-shot — sin cambios funcionales) ──
+    // ── HARD-GATE (SOP v3.2, one-shot, SIEMPRE activo) ──
     let gatedDecisionId: number | undefined;
+    let gatedApprovalStatus: string | null = null;
     let boundRiskPct = Math.min(MAX_RISK_PCT, Math.max(0.1, riskPercentage ?? 0.5));
+    if (PIPELINE_GATE_ENV_OFF) {
+      console.warn("[ExecuteMT5] PIPELINE_GATE=off solicitado e IGNORADO — el bypass fue eliminado (PROMPT 06 §23)");
+    }
 
-    if (PIPELINE_GATE) {
+    {
       const decision = getRecentExecuteDecision(symbol, DECISION_VALIDITY_MINUTES);
       if (!decision) {
         return [
@@ -274,9 +283,13 @@ export const executeTradeMT5: Tool = {
         }
       }
 
-      // Riesgo FORZADO desde la decisión: el riskPercentage del LLM se ignora
+      // Riesgo FORZADO desde la decisión: el riskPercentage del LLM se ignora.
+      // PROMPT 06 §8: si la decisión no trae riesgo numérico → RECHAZO
+      // (nunca caer silenciosamente al valor propuesto por el LLM).
       if (decision.risk_pct && Number.isFinite(decision.risk_pct)) {
         boundRiskPct = Math.min(MAX_RISK_PCT, Math.max(0.1, decision.risk_pct));
+      } else {
+        return `🚫 **EJECUCIÓN BLOQUEADA:** la decisión #${decision.id} no tiene risk_pct numérico (fail-closed §8). Ejecuta \`runDecisionPipeline\` de nuevo — el planner debe emitir un riesgo válido.`;
       }
 
       // ONE-SHOT: reclamar la decisión atómicamente (una decisión = una orden)
@@ -284,6 +297,21 @@ export const executeTradeMT5: Tool = {
         return `🚫 **EJECUCIÓN BLOQUEADA:** la decisión #${decision.id} ya fue consumida por una orden previa (one-shot). Ejecuta \`runDecisionPipeline\` para una nueva decisión.`;
       }
       gatedDecisionId = decision.id;
+      gatedApprovalStatus = decision.approval_status ?? null;
+
+      // ── POLICY (PROMPT 06 §6/§12/§19): la gobernanza decide si está
+      // permitido — kill switch, modo, nivel efectivo y aprobación humana.
+      const policyVerdict = assertExecutionForDecision(decision.approval_status ?? null);
+      if (!policyVerdict.allowed) {
+        releaseDecision(decision.id);
+        return [
+          `🛑 **EJECUCIÓN BLOQUEADA POR POLICY**`,
+          ``,
+          `${policyVerdict.reason}`,
+          ``,
+          `_La decisión #${decision.id} fue liberada (sigue vigente hasta su expiración)._`,
+        ].join("\n");
+      }
     }
 
     // 1. Verificar que el bridge esté activo (con liberación del claim si falla)
@@ -438,16 +466,44 @@ export const executeTradeMT5: Tool = {
         ].join("\n");
       }
 
-      // 9. Enviar orden al bridge (si falla, liberar la decisión reclamada)
+      // 9. Enviar orden al bridge con CONTEXTO de aprobación (§5/§13):
+      //    el EXECUTION GUARD dentro de placeOrder re-valida TODO en el
+      //    punto de envío (kill switch, riesgo de cuenta, spread, dedup…).
       let result;
       try {
-        result = await MT5Bridge.placeOrder(orderPayload);
+        result = await MT5Bridge.placeOrder(orderPayload, {
+          decisionId: gatedDecisionId ?? null,
+          approvalStatus: gatedApprovalStatus, // el guard re-verifica el §12 en el punto de envío
+        });
       } catch (orderErr) {
+        const err = orderErr as Error & { code?: string };
+        if (err.code === "BRIDGE_TIMEOUT") {
+          // §13: estado DESCONOCIDO — la orden pudo haber llegado a MT5.
+          // NO se libera la decisión (evita duplicar la orden en un retry):
+          // queda consumida y la orden se registra como 'unknown'.
+          try {
+            saveOrder({
+              decisionId: gatedDecisionId,
+              symbol, direction, orderType,
+              volume: lotSize, entryPrice, stopLoss: stopLossPrice, takeProfit: takeProfitPrice,
+              riskPct: boundRiskPct,
+              status: "unknown",
+              verificationStatus: "unknown",
+            });
+          } catch {}
+          return `⚠️ **Timeout del bridge tras enviar la orden: estado DESCONOCIDO.**\nLa decisión #${gatedDecisionId} queda CONSUMIDA (no se libera) para evitar duplicar la orden. Verifica en MT5 si la orden existe antes de reintentar nada.`;
+        }
+        if (err.code === "GUARD_REJECTED") {
+          // El guard rechazó ANTES de enviar: no hay orden en MT5 → liberar.
+          if (gatedDecisionId) releaseDecision(gatedDecisionId);
+          return `🛑 **EXECUTION GUARD RECHAZÓ LA ORDEN (sin envío):**\n${err.message}\n\n_La decisión #${gatedDecisionId} fue liberada._`;
+        }
         if (gatedDecisionId) releaseDecision(gatedDecisionId);
         throw orderErr;
       }
 
       // 10. Registrar la orden para el settlement (vínculo decisión ↔ orden)
+      //     con verificación request-vs-actual (§13).
       try {
         saveOrder({
           decisionId: gatedDecisionId,
@@ -460,6 +516,10 @@ export const executeTradeMT5: Tool = {
           takeProfit: takeProfitPrice,
           ticket: result.ticket,
           riskPct: boundRiskPct,
+          riskAmount: realRisk,
+          strategy: `SMC-hardgate`,
+          expiration: expirationEpoch ?? null,
+          verificationStatus: result.verification,
           status: "placed",
         });
       } catch (dbErr) {
@@ -484,6 +544,7 @@ export const executeTradeMT5: Tool = {
 | **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |
 | **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |
 | **Ticket MT5** | #${result.ticket} |
+| **Verificación §13** | ${result.verification === "verified" ? "✅ verified (retcode/precio/volumen concilian)" : "⚠️ divergence — revisar en MT5"} |
 | **Servidor** | ${account.server} |
       `.trim();
 

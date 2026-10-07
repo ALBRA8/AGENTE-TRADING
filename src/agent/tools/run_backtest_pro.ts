@@ -1,11 +1,26 @@
 // ============================================================
 // src/agent/tools/run_backtest_pro.ts
 // Tool mejorado con opciones PRO (simulacion historica + metricas institucionales + stress testing)
+//
+// Task 10-b (§7): TODO output lleva cabecera de honestidad y manifest de
+// reproducibilidad (run_id / data_hash / code_version / seed persistidos en
+// backtest_runs). El reporte de estrés se escribe con fs/promises (antes:
+// Bun.write, inexistente en Node) en BACKTEST_OUTPUT_DIR (default ./reports).
 // ============================================================
 
+import { writeFile, mkdir } from "node:fs/promises";
+import path from "node:path";
 import type { Tool } from "../types.js";
 import db from "../../database/sqlite.js";
-import { BacktestEngine } from "../../backtest/engine.js";
+import {
+  BacktestEngine,
+  buildRunManifest,
+  persistBacktestManifest,
+  computeCandlesHash,
+  seedFromHash,
+  verdictHeader,
+  CODE_VERSION,
+} from "../../backtest/engine.js";
 import { StressTestEngine, generateStressReport, HISTORICAL_SCENARIOS } from "../../backtest/stress_test.js";
 import type { BacktestConfig, StressScenario } from "../../backtest/types.js";
 import { MT5Bridge } from "../../config/mt5bridge.js";
@@ -248,6 +263,18 @@ Sin bridge, usa mode='report' para analizar trades pasados.
 
     const result = await engine.runBacktest(candles, config);
 
+    // §7: manifest del run (registrado por el engine en backtest_runs)
+    const man = engine.lastManifest;
+    const header = verdictHeader(man?.verdict ?? "INVALID_NOT_REPRODUCIBLE");
+    const manifestBlock = man
+      ? `run_id:       ${man.runId}
+data_hash:    ${(man.dataHash ?? "").slice(0, 16)}…
+code_version: ${man.codeVersion ?? "-"}
+seed:         ${man.seed ?? "-"}
+veredicto:    ${man.verdict}
+`
+      : "manifest:    NO DISPONIBLE (run no auditable)\n";
+
     if (generateHTML) {
       const reportPath = engine.generateReport(result, true);
       console.log(`Report HTML: ${reportPath}`);
@@ -257,7 +284,12 @@ Sin bridge, usa mode='report' para analizar trades pasados.
     const mc = result.monteCarlo;
 
     return `
+${header}
 🚀 Backtest PRO Completado - ${asset} ${timeframe}
+
+${manifestBlock}
+⚠️ Métricas avanzadas (Sharpe/Sortino/SQN/Monte Carlo) con formulación conocida-imperfecta:
+   usar SOLO winRate, profitFactor, expectancy y maxDD (realized) para decisiones.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Resultados Principales
@@ -367,6 +399,27 @@ async function runStressMode(args: Record<string, unknown>): Promise<string> {
       }
     }
 
+    // §7: manifest propio del run de estrés. HONESTIDAD: el motor de estrés
+    // (stress_test.ts) mantiene aleatoriedad interna SIN sembrar y campos NaN
+    // conocidos (Task 10-c) → se etiqueta INVALID_NOT_REPRODUCIBLE aunque el
+    // manifest de metadatos esté completo. Nunca presentar estrés como válido.
+    const dataHash = computeCandlesHash(candles);
+    const { manifest: stressManifest } = buildRunManifest({
+      engine: "stress",
+      symbol: asset,
+      dataHash,
+      paramsJson: JSON.stringify(config),
+      codeVersion: CODE_VERSION,
+      seed: seedFromHash(dataHash),
+    });
+    stressManifest.verdict = "INVALID_NOT_REPRODUCIBLE";
+    stressManifest.missing.push("seeded_stress_engine");
+    stressManifest.warnings.push(
+      "stress_test.ts con aleatoriedad interna sin sembrar y métricas NaN conocidas (Task 10-c)"
+    );
+    await persistBacktestManifest(stressManifest);
+    const stressHeader = verdictHeader(stressManifest.verdict);
+
     // Crear engine con escenarios filtrados
     const stressEngine = new StressTestEngine(scenarios, { enableMonteCarlo: true });
     const stressResult = await stressEngine.runStressTest(candles, config);
@@ -374,16 +427,28 @@ async function runStressMode(args: Record<string, unknown>): Promise<string> {
     // Generar reporte de texto
     const reportText = generateStressReport(stressResult);
 
-    // Guardar reporte detallado en archivo
-    const reportPath = `/mnt/d/PROYECTOS/AGENTES CON IA/AGENTE TRADING/data/stress_reports/stress_${asset}_${timeframe}_${Date.now()}.txt`;
-    await Bun.write(reportPath, reportText);
+    // Guardar reporte detallado en archivo (FIX: Bun.write → fs/promises;
+    // ruta WSL hardcodeada → env BACKTEST_OUTPUT_DIR, default ./reports)
+    const outputDir = process.env.BACKTEST_OUTPUT_DIR ?? "./reports";
+    await mkdir(outputDir, { recursive: true });
+    const reportPath = path.join(
+      outputDir,
+      `stress_${asset}_${timeframe}_${Date.now()}.txt`
+    );
+    await writeFile(reportPath, reportText, "utf8");
 
     // Resumen ejecutivo
     const s = stressResult.summary;
     const b = stressResult.baseline.metrics;
 
     return `
+${stressHeader}
 🧪 STRESS TEST COMPLETO - ${asset} ${timeframe}
+
+run_id:       ${stressManifest.runId}
+code_version: ${stressManifest.codeVersion ?? "-"}
+⚠️ Motor de estrés EN REPARACIÓN (aleatoriedad sin sembrar, métricas NaN conocidas):
+   resultados NO usables para decisiones reales ni promoción de lecciones.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BASELINE (Condiciones Normales)

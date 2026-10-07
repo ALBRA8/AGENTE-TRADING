@@ -8,12 +8,13 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe')"
+    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe') && npm run test:e2e",
+    "test:e2e": "tsx tests/e2e_pipeline.ts"
   },
   "dependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "better-sqlite3": "^11.5.0",
+    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.6",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",

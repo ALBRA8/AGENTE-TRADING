@@ -1,29 +1,45 @@
 // ============================================================
 // src/backtest/index.ts
 // Módulo unificado de backtesting profesional
-// Exporta todo el sistema de backtesting
+// Exporta el sistema de backtesting
+//
+// FIX (auditoría 9-g): el barrel re-exportaba símbolos inexistentes
+// (SMCDetector, MetricsCalculator, TradeSimulator, ReportGenerator,
+// SMCState, BOSChange, ChoCh, TradeDirection, TradeResult,
+// BenchmarkResult…), lo que generaba 36 errores tsc y CRASHEABA el
+// import de TODO el módulo (TS2305 al cargar index.js).
+// Ahora solo se exportan símbolos que existen de verdad.
 // ============================================================
 
 // ═══════════════════════════════════════════════════════════
-// MOTOR PRINCIPAL
+// MOTOR PRINCIPAL + §7 REPRODUCIBILIDAD
 // ═══════════════════════════════════════════════════════════
 
-export { BacktestEngine, type BacktestEngineConfig } from "./engine.js";
+export {
+  BacktestEngine,
+  buildRunManifest,
+  persistBacktestManifest,
+  computeCandlesHash,
+  seedFromHash,
+  mulberry32,
+  verdictHeader,
+  CODE_VERSION,
+  type BacktestEngineConfig,
+  type BacktestRunManifest,
+  type BacktestVerdict,
+} from "./engine.js";
 
 // ═══════════════════════════════════════════════════════════
 // DETECTORES SMC
 // ═══════════════════════════════════════════════════════════
 
 export {
-  SMCDetector,
-  type SMCState,
-  type SMCStructure,
+  SWING_LOOKBACK,
   processCandles,
   detectFVGs,
   detectSwingPoints,
   detectStructureShifts,
   associateFVGsWithSetups,
-  calculateRVOL,
   isNYKillzone,
   isValidSetup,
 } from "./smc_detector.js";
@@ -32,14 +48,19 @@ export {
 // SIMULACIÓN
 // ═══════════════════════════════════════════════════════════
 
-export { TradeSimulator, simulateTrades } from "./simulator.js";
+export {
+  simulateTrades,
+  resolvePipSize,
+  resolvePipValueUSD,
+  DEFAULT_FRICTION,
+  type FrictionConfig,
+} from "./simulator.js";
 
 // ═══════════════════════════════════════════════════════════
 // MÉTRICAS
 // ═══════════════════════════════════════════════════════════
 
 export {
-  MetricsCalculator,
   calculateMetrics,
   monteCarloSimulation,
   calculateBuyHold,
@@ -49,7 +70,7 @@ export {
 // REPORTES
 // ═══════════════════════════════════════════════════════════
 
-export { ReportGenerator, generateHTMLReport } from "./report_generator.js";
+export { generateHTMLReport, type ReportOptions } from "./report_generator.js";
 
 // ═══════════════════════════════════════════════════════════
 // WALK-FORWARD ANALYSIS (Anti-Overfitting)
@@ -81,16 +102,9 @@ export {
   generateStressReport,
   HISTORICAL_SCENARIOS,
 } from "./stress_test.js";
-export type {
-  StressScenario,
-  StressResult,
-  StressedResult,
-  StressedTrade,
-  StressedMetrics,
-} from "./stress_test.js";
 
 // ═══════════════════════════════════════════════════════════
-// TIPOS
+// TIPOS (solo los declarados de verdad en types.ts)
 // ═══════════════════════════════════════════════════════════
 
 export type {
@@ -103,18 +117,12 @@ export type {
   FVG,
   SwingPoint,
   SMCSetup,
-  SMCState,
-  BOSChange,
-  ChoCh,
 
   // Trading
   Trade,
-  TradeDirection,
-  TradeResult,
 
   // Configuración
   BacktestConfig,
-  BacktestEngineConfig,
 
   // Métricas
   PerformanceMetrics,
@@ -127,9 +135,7 @@ export type {
   // Resultados
   BacktestResult,
   EquityPoint,
-  BenchmarkResult,
   HeatmapData,
-  ReportOptions,
 
   // WFA
   WFAWindow,
@@ -147,13 +153,13 @@ export type {
   RegimeStats,
 
   // Stress Testing
-  StressScenario,
-  StressResult,
-  StressedResult,
-  StressedTrade,
-  StressedMetrics,
   StressEventType,
+  StressScenario,
+  StressedMetrics,
   StressedEquityImpact,
   StressedRisk,
   StressSummary,
+  StressResult,
+  StressedResult,
+  StressedTrade,
 } from "./types.js";

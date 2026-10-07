@@ -9,12 +9,23 @@ import { evaluateBrain, getBrainTrend } from "./agent/brain_eval.js";
 import { runSettlement, startAgentMaintenance } from "./agent/settlement.js";
 import { getTrackRecord } from "./agent/trackrecord.js";
 import { getLicenseGate, renderLicenseLogLine } from "./license.js";
+import {
+  getPolicySummary,
+  setPolicyMode,
+  setAutonomyLevel,
+  setAutonomyCeiling,
+  setKillSwitch,
+  approveDecision,
+  getPolicyEventsHistory,
+  type PolicyMode,
+} from "./agent/policy.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Modo operativo honesto: DEMO salvo opt-in explícito LIVE_TRADING=true.
-const TRADING_MODE = (process.env.LIVE_TRADING ?? "").trim().toLowerCase() === "true" ? "LIVE" : "DEMO";
+// PROMPT 06 §6/§19: el modo ya NO se infiere de LIVE_TRADING — lo emite el
+// Policy Engine (policy_events > env, default PAPER). LIVE_TRADING es solo el
+// segundo factor del modo LIVE.
 
 // ── SEGURIDAD (auditoría 6-b + Task 8-b): rate limit por IP a mano ──
 // Sin dependencias nuevas: Map en memoria con ventana fija de 60s.
@@ -108,7 +119,7 @@ export function startDashboard(port: number = 3000) {
 
   // ── API: healthcheck mínimo (sin auth, sin datos) ──
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, mode: TRADING_MODE, ts: new Date().toISOString() });
+    res.json({ ok: true, mode: getPolicySummary().mode, ts: new Date().toISOString() });
   });
 
   // ── API: Track Record — la vitrina pública (Task 8-b) ──
@@ -137,12 +148,61 @@ export function startDashboard(port: number = 3000) {
     }
   });
 
+  // ── PROMPT 06 §6/§19: POLICY API ──
+  // GET: estado vigente (público: modo/nivel/kill son datos de operación, sin secretos).
+  app.get("/api/policy", (_req, res) => {
+    try {
+      res.json({ ...getPolicySummary(), history: getPolicyEventsHistory(20) });
+    } catch (error) {
+      fail(res, "policy GET", error);
+    }
+  });
+
+  // POST: cambios de gobernanza — SIEMPRE exigen token (si no hay
+  // DASHBOARD_TOKEN configurado, el control de policy está CERRADO: fail-closed).
+  app.post("/api/policy", (req, res) => {
+    try {
+      const token = process.env.DASHBOARD_TOKEN;
+      if (!token) {
+        return res.status(503).json({ error: "Control de policy deshabilitado: exporta DASHBOARD_TOKEN para operar la gobernanza (fail-closed)." });
+      }
+      const auth = req.headers.authorization ?? "";
+      if (auth !== `Bearer ${token}`) {
+        return res.status(401).json({ error: "No autorizado" });
+      }
+      const { action, value, reason, decisionId } = req.body ?? {};
+      const actor = `dashboard:${req.ip ?? "?"}`;
+      const razon = String(reason ?? "(sin razón)").slice(0, 300);
+      switch (String(action ?? "")) {
+        case "set_mode":
+          return res.json({ policy: setPolicyMode(actor, String(value).toUpperCase() as PolicyMode, razon) });
+        case "set_level":
+          return res.json({ policy: setAutonomyLevel(actor, parseInt(String(value), 10), razon) });
+        case "set_ceiling":
+          return res.json({ policy: setAutonomyCeiling(actor, parseInt(String(value), 10), razon) });
+        case "kill_switch":
+          return res.json({ policy: setKillSwitch(actor, String(value).toLowerCase() === "on", razon) });
+        case "approve": {
+          const id = parseInt(String(decisionId), 10);
+          if (!Number.isFinite(id)) return res.status(400).json({ error: "decisionId requerido" });
+          const ok = approveDecision(id, actor);
+          return res.json({ approved: ok, policy: getPolicySummary() });
+        }
+        default:
+          return res.status(400).json({ error: "action inválida: set_mode | set_level | set_ceiling | kill_switch | approve" });
+      }
+    } catch (error) {
+      fail(res, "policy POST", error);
+    }
+  });
+
   // ── API: Observabilidad del agente (Fase 5) ──
   app.get("/api/agent/status", async (_req, res) => {
     try {
       const status = await getAgentStatusAsync();
       // Campo `mode` para el badge [DEMO]/[LIVE] de la UI (sin auth: GET).
-      res.json({ ...status, mode: TRADING_MODE });
+      const pol = getPolicySummary();
+      res.json({ ...status, mode: pol.mode, autonomyLevel: pol.effectiveLevel, autonomyCeiling: pol.autonomyCeiling, killSwitch: pol.killSwitch });
     } catch (error) {
       fail(res, "agent/status", error);
     }
@@ -150,11 +210,18 @@ export function startDashboard(port: number = 3000) {
 
   // ── API: Evaluación del cerebro (Fase 4) ──
   // GET solo LEE; el snapshot de tendencia se genera solo con ?snapshot=1
-  // (un cliente ruidoso no debe envenenar la tendencia, auditoría 6-b)
+  // (un cliente ruidoso no debe envenenar la tendencia, auditoría 6-b).
+  // PROMPT 06 §23: snapshot=1 ESCRIBE → exige token; sin token configurado,
+  // el snapshot queda DENEGADO (fail-closed, auditoría 9-h).
   app.get("/api/agent/brain", (req, res) => {
     try {
       const report = evaluateBrain();
       if (req.query.snapshot === "1") {
+        const token = process.env.DASHBOARD_TOKEN;
+        const auth = req.headers.authorization ?? "";
+        if (!token || auth !== `Bearer ${token}`) {
+          return res.status(403).json({ error: "snapshot=1 requiere DASHBOARD_TOKEN (escritura protegida)" });
+        }
         db.prepare(`INSERT INTO brain_evaluations (score, report_json) VALUES (?, ?)`)
           .run(report.score, JSON.stringify(report));
       }
@@ -230,13 +297,43 @@ export function startDashboard(port: number = 3000) {
     }
   });
 
+  // ── PROMPT 06 §20: DOCTOR — diagnóstico de las 9 secciones ──
+  app.get("/api/agent/doctor", async (_req, res) => {
+    try {
+      const { runDoctor, renderDoctorMarkdown } = await import("./agent/doctor.js");
+      const report = await runDoctor();
+      res.json({ ...report, markdown: renderDoctorMarkdown(report) });
+    } catch (error) {
+      fail(res, "agent/doctor", error);
+    }
+  });
+
+  // ── PROMPT 06 §5: SKILLS — contrato declarativo de capacidades ──
+  app.get("/api/skills", async (_req, res) => {
+    try {
+      const { getSkillsRegistry, renderSkillsMarkdown } = await import("./skills/registry.js");
+      res.json({ skills: getSkillsRegistry(), markdown: renderSkillsMarkdown() });
+    } catch (error) {
+      fail(res, "skills", error);
+    }
+  });
+
   // ── Arranque ──
   // SEGURIDAD: bind a localhost por defecto. El dashboard manipula la cuenta
   // (chat → tools); expónlo en LAN/0.0.0.0 SOLO con DASHBOARD_TOKEN configurado.
+  // PROMPT 06 §11: LIVE sin DASHBOARD_TOKEN ABORTA EL ARRANQUE (nunca inferir
+  // autorización: sin segundo factor no hay LIVE, ni del dashboard ni del bot).
   const host = process.env.HOST ?? "127.0.0.1";
+  const bootPolicy = getPolicySummary();
+  const bootToken = process.env.DASHBOARD_TOKEN;
+  if ((bootPolicy.mode === "LIVE" || bootPolicy.liveTradingEnv) && !bootToken) {
+    throw new Error(
+      "ARRANQUE ABORTADO: modo LIVE (o LIVE_TRADING=true) sin DASHBOARD_TOKEN. Sin segundo factor de autenticación no hay trading real (PROMPT 06 §11). Configura DASHBOARD_TOKEN o vuelve a PAPER."
+    );
+  }
   app.listen(port, host, () => {
     console.log(`[Dashboard] 🌐 Web Interface running at http://${host}:${port}${host === "127.0.0.1" ? " (solo local — exporta HOST para exponer en red)" : " ⚠️ expuesto"}`);
-    console.log(`[Dashboard] Modo: ${TRADING_MODE === "LIVE" ? "🔴 LIVE — operativa real en MT5 (opt-in LIVE_TRADING=true)" : "🟢 DEMO — sin ejecución real de órdenes"}`);
+    console.log(`[Dashboard] Modo: ${bootPolicy.mode} · autonomía L${bootPolicy.effectiveLevel} (techo L${bootPolicy.autonomyCeiling}) · kill switch ${bootPolicy.killSwitch ? "🛑 ACTIVO" : "inactivo"}${bootPolicy.mode === "LIVE" ? " — 🔴 LIVE con doble factor" : " — sin ejecución real de órdenes"}`);
     console.log(renderLicenseLogLine(license.state));
     console.log(`[Dashboard] Rate limit: ${RATE_LIMIT_PER_MIN} req/min por IP sobre /api/* (env RATE_LIMIT_PER_MIN)`);
   });

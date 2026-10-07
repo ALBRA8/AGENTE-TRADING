@@ -21,6 +21,7 @@ import { searchLessonsTool } from "./tools/search_lessons.js";
 import { settleDecisions } from "./tools/settle_decisions.js";
 import { evaluateBrainTool } from "./tools/evaluate_brain.js";
 import { agentStatusTool } from "./tools/agent_status.js";
+import { doctorStatusTool } from "./tools/doctor_status.js";
 import { captureAutoError } from "./self_improve.js";
 
 // ── Register all available tools ───────────────────────────
@@ -42,6 +43,7 @@ const TOOL_REGISTRY: Tool[] = [
  settleDecisions,
  evaluateBrainTool,
  agentStatusTool,
+ doctorStatusTool, // Task 10-c §20: doctor del agente (agrega checks existentes)
  // agrega más herramientas aquí conforme crece el agente
 ];
 

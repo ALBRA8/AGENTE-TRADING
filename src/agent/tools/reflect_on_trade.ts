@@ -59,6 +59,18 @@ export const reflectOnTrade: Tool = {
       errorMade,
       userNote,
       source: "user",
+      // ── Task 10-c (MemoryDV §9): evidencia honesta de origen ──
+      // El PnL lo reporta el USUARIO (no lo observó el sistema):
+      // truth_level='REPORTED' ≠ 'OBSERVED' (que reserva settlement para
+      // PnL cerrado con decision_id). Sin PnL → inferencia semántica.
+      evidence: {
+        origin: "user_report",
+        symbol: symbol ?? null,
+        setup: setup ?? null,
+        pnl: outcomePnl ?? null,
+      },
+      truthLevel: outcomePnl !== undefined ? "REPORTED" : "INFERRED",
+      memoryType: outcomePnl !== undefined ? "EPISODIC" : "SEMANTIC",
     });
 
     // Aprovecha para triage de errores automáticos recurrentes

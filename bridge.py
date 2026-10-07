@@ -18,10 +18,23 @@ El servidor escucha en http://localhost:5001
 """
 
 import json
+import os
 import sys
 import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
+
+
+def check_bridge_token() -> tuple | None:
+    """PROMPT 06 §5/§23: candado de escritura del bridge (order/cancel).
+    Sin BRIDGE_TOKEN configurado → denegado (fail-closed). Cadena vacía =
+    desactivación explícita por el operador. Devuelve (response, code) o None."""
+    token = os.environ.get("BRIDGE_TOKEN")
+    if token is None:
+        return jsonify({"error": "BRIDGE_TOKEN no configurado: operación DENEGADA (fail-closed §5)"}), 403
+    if token != "" and request.headers.get("X-AGT-Token") != token:
+        return jsonify({"error": "Token de bridge inválido (X-AGT-Token)"}), 401
+    return None
 
 try:
     import MetaTrader5 as mt5
@@ -247,6 +260,14 @@ def place_order():
     if not body:
         return jsonify({"error": "Body JSON requerido"}), 400
 
+    # ── PROMPT 06 §5/§23: el bridge es una frontera de ejecución, no un
+    # endpoint abierto (candado compartido con /cancel vía check_bridge_token).
+    denied = check_bridge_token()
+    if denied:
+        return denied
+    if not request.is_json:
+        return jsonify({"error": "Content-Type debe ser application/json"}), 415
+
     symbol      = normalize_symbol(body.get("symbol", "").upper())
     order_type  = body.get("type", "BUY_LIMIT").upper()
     volume      = float(body.get("volume", 0.01))
@@ -255,6 +276,12 @@ def place_order():
     take_profit = float(body.get("takeProfit", 0))
     comment     = body.get("comment", "Bot-SMC-Auto")
     expiration  = body.get("expiration")  # epoch en segundos (opcional)
+
+    # PROMPT 06 §5: una pendiente sin SL/TP es una orden sin gestión de
+    # riesgo — el bridge la rechaza aunque el cliente Node se equivoque.
+    if "LIMIT" in order_type or "STOP" in order_type:
+        if stop_loss <= 0 or take_profit <= 0:
+            return jsonify({"error": "Órdenes pendientes exigen stopLoss y takeProfit > 0 (fail-closed §5)"}), 400
 
     # Verificar que el símbolo está disponible
     info = mt5.symbol_info(symbol)
@@ -321,13 +348,20 @@ def place_order():
         }), 400
 
     log.info(f"Orden ejecutada: ticket={result.order}, retcode={result.retcode}")
+    # PROMPT 06 §13: devolver los valores REALES del fill de MT5 (result.price/
+    # result.volume), no los del request — la verificación request-vs-actual
+    # vive en el cliente, y necesita datos honestos del broker.
+    actual_price = float(getattr(result, "price", 0) or 0)
+    actual_volume = float(getattr(result, "volume", 0) or 0)
     return jsonify({
         "success":  True,
         "ticket":   result.order,
         "retcode":  result.retcode,
         "comment":  result.comment,
-        "volume":   volume,
-        "price":    price,
+        "volume":   actual_volume if actual_volume > 0 else volume,
+        "price":    actual_price if actual_price > 0 else price,
+        "requested_price": price,
+        "requested_volume": volume,
         "symbol":   symbol,
         "type":     order_type,
     })
@@ -384,6 +418,9 @@ def get_pending_orders():
 @app.route("/cancel/<int:ticket>", methods=["DELETE"])
 def cancel_order(ticket: int):
     """Cancela una orden pendiente por ticket."""
+    denied = check_bridge_token()
+    if denied:
+        return denied
     request_data = {
         "action": mt5.TRADE_ACTION_REMOVE,
         "order":  ticket,

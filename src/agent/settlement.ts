@@ -29,6 +29,7 @@ import db, {
 } from "../database/sqlite.js";
 import { MT5Bridge } from "../config/mt5bridge.js";
 import { reflectOnExperience } from "./self_improve.js";
+import { consolidateMemory, type ConsolidationSummary } from "./consolidation.js";
 
 const HORIZON_HOURS = Math.max(
   1,
@@ -60,7 +61,18 @@ export async function runSettlement(limit = 10): Promise<SettlementSummary> {
   maintenanceState.running = true;
 
   try {
-    return await runSettlementInner(limit, summary);
+    const result = await runSettlementInner(limit, summary);
+    // ── Task 10-c §3: consolidación de memoria DENTRO del mismo lock ──
+    // Tras cerrar outcomes corremos el pipeline EVENT→…→PROMOTION. Un fallo
+    // de consolidación jamás tumba el settlement (log honesto, sin relanzar).
+    try {
+      const cons = consolidateMemory();
+      maintenanceState.lastConsolidationAt = new Date().toISOString();
+      maintenanceState.lastConsolidation = cons;
+    } catch (err) {
+      console.warn(`[Settlement] consolidación falló (no crítico): ${(err as Error).message}`);
+    }
+    return result;
   } finally {
     maintenanceState.running = false;
   }
@@ -178,12 +190,28 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
 }
 
 /**
+ * Confianza honesta de la evidencia (MemoryDV §9): magnitud del PnL cerrado
+ * respecto al riesgo planeado de la orden (R múltiplo normalizado a [0,1]).
+ * Sin riesgo conocido → 0.5 (presencia de PnL real, magnitud desconocida).
+ */
+function evidenceConfidence(pnl: number, riskAmount?: number | null): number {
+  const risk = Number(riskAmount);
+  if (!Number.isFinite(risk) || risk <= 0) return 0.5;
+  const c = Math.abs(pnl) / risk;
+  return Math.round(Math.min(1, Math.max(0.05, c)) * 1_000) / 1_000;
+}
+
+/**
  * Cierra una decisión con PnL real y dispara la reflexión automática.
  * La reflexión es best-effort: si falla, el outcome ya quedó guardado.
+ *
+ * Task 10-c (MemoryDV §9): la lección nace CON evidencia citable
+ * (decision_id, símbolo, PnL, fuente del outcome) y truth_level='OBSERVED'
+ * — el PnL cerrado es un hecho observado, no una inferencia del LLM.
  */
 async function settleWithPnl(
   dec: { id: number; symbol: string; direction?: string | null; risk_pct?: number | null; confidence?: number | null },
-  order: { ticket?: number | null; volume?: number | null; direction?: string },
+  order: { ticket?: number | null; volume?: number | null; direction?: string; risk_amount?: number | null },
   pnl: number,
   source: string,
   _provisional: boolean
@@ -201,13 +229,26 @@ async function settleWithPnl(
         ? `Trade cerrado en ganancia (${pnl.toFixed(2)} USD) tras decisión #${dec.id} con confianza ${(dec.confidence ?? 0) * 100 | 0}%.`
         : `Trade cerrado en pérdida (${pnl.toFixed(2)} USD) tras decisión #${dec.id} con confianza ${(dec.confidence ?? 0) * 100 | 0}%. Revisar si el filtro del SOP falló o si fue riesgo de mercado normal.`,
     source: "reflection",
+    // ── MemoryDV: evidencia + verdad observada + tipo episódico ──
+    evidence: {
+      decision_id: dec.id,
+      symbol: dec.symbol,
+      pnl: Number(pnl.toFixed(2)),
+      outcome_source: source,
+    },
+    truthLevel: "OBSERVED",
+    memoryType: "EPISODIC",
+    confidence: evidenceConfidence(pnl, order?.risk_amount),
   }).catch(() => {});
 }
 
-// ── Bucle de mantenimiento del agente (Fase 2 + 5) ──────────
+// ── Bucle de mantenimiento del agente (Fase 2 + 5 + consolidación §3) ──
 interface MaintenanceState {
   lastSettlementAt?: string;
   lastSettlement?: SettlementSummary;
+  lastConsolidationAt?: string;
+  lastConsolidation?: ConsolidationSummary;
+  /** @deprecated aún leído por observability.ts (Task 8); mantener por compat */
   lastTriageAt?: string;
   running: boolean;
 }
@@ -228,7 +269,8 @@ export function startAgentMaintenance(): void {
 
   const tick = async () => {
     // El lock de concurrencia vive dentro de runSettlement (compartido con
-    // el endpoint y el tool). Aquí solo registramos el resultado.
+    // el endpoint y el tool); la consolidación §3 corre DENTRO de ese lock
+    // (ver runSettlement). Aquí solo registramos el resultado.
     try {
       const summary = await runSettlement(10);
       maintenanceState.lastSettlementAt = new Date().toISOString();

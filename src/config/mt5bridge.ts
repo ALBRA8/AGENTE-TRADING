@@ -7,7 +7,11 @@
 // al agente colgado para siempre (hallazgo auditoría 6-b).
 // Nuevo: getSymbolInfo (sizing exacto multi-broker) y getPendingOrders
 // (limpieza de pendientes obsoletos del pipeline).
+// PROMPT 06 §5/§13: placeOrder invoca al EXECUTION GUARD independiente
+// y verifica request-vs-actual tras la respuesta del broker.
 // ============================================================
+
+import { assertOrderAllowed, type GuardCheck } from "../agent/execution_guard.js";
 
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL ?? "http://localhost:5001";
 const BRIDGE_TIMEOUT_MS = (() => {
@@ -138,9 +142,11 @@ async function bridgeFetch<T>(path: string, options?: RequestInit): Promise<T> {
     });
   } catch (err) {
     if ((err as Error).name === "AbortError") {
-      throw new Error(
+      const e = new Error(
         `MT5 Bridge timeout tras ${BRIDGE_TIMEOUT_MS}ms en ${path} (bridge colgado o saturado). Sube BRIDGE_TIMEOUT_MS si tu red lo justifica.`
-      );
+      ) as Error & { code: string };
+      e.code = "BRIDGE_TIMEOUT";
+      throw e;
     }
     throw new Error(
       `MT5 Bridge no disponible en ${MT5_BRIDGE_URL}. Asegúrate de que bridge.py esté corriendo. Error: ${(err as Error).message}`
@@ -198,12 +204,53 @@ export const MT5Bridge = {
 
   /**
    * Coloca una orden en MT5.
+   *
+   * PROMPT 06 §5: aquí vive el EXECUTION GUARD INDEPENDIENTE — se evalúa
+   * DESPUÉS del tool y del hard-gate, en el único punto por el que pasa
+   * cualquier orden real (LLM, dashboard, Telegram, MCP futuro). Un veredicto
+   * negativo del guard lanza y la orden NUNCA sale del proceso.
+   *
+   * PROMPT 06 §13: tras la respuesta del broker se VERIFICA request-vs-actual
+   * (retcode, volume, price) y se anota verification_status: 'verified' |
+   * 'divergence'. Nunca se asume ejecutado por el mero HTTP 200.
    */
-  async placeOrder(order: MT5OrderRequest): Promise<MT5OrderResult> {
-    return bridgeFetch<MT5OrderResult>("/order", {
+  async placeOrder(
+    order: MT5OrderRequest,
+    ctx?: { decisionId?: number | null; approvalStatus?: string | null }
+  ): Promise<MT5OrderResult & { verification: "verified" | "divergence"; guardChecks: GuardCheck[] }> {
+    // ── EXECUTION GUARD (fail-closed): el tick se resuelve AQUÍ, en el punto
+    //    de envío, para juzgar con datos vivos y no con los de la decisión. ──
+    const tick = await this.getPrice(order.symbol);
+    const guard = await assertOrderAllowed(order, ctx ?? {}, tick);
+    if (!guard.allowed) {
+      const e = new Error(
+        `🛑 EXECUTION GUARD RECHAZA LA ORDEN (${order.symbol} ${order.type} vol=${order.volume}): ${guard.reason}`
+      ) as Error & { code: string; guardChecks: GuardCheck[] };
+      e.code = "GUARD_REJECTED";
+      e.guardChecks = guard.checks;
+      throw e;
+    }
+
+    const result = await bridgeFetch<MT5OrderResult>("/order", {
       method: "POST",
       body: JSON.stringify(order),
     });
+
+    // ── §13 VERIFY: retcode aceptado + concordancia request vs actual ──
+    const ACCEPTED_RETCODES = new Set([10008, 10009]); // TRADE_RETCODE_PLACED / DONE
+    const retcodeOk = ACCEPTED_RETCODES.has(Number(result.retcode));
+    const priceTol = Math.max(Math.abs(Number(result.price) || 0) * 0.001, 1e-8);
+    const priceOk =
+      !order.price || !result.price ||
+      Math.abs(Number(result.price) - Number(order.price)) <= priceTol;
+    const volumeOk = !result.volume || Math.abs(Number(result.volume) - Number(order.volume)) < 1e-8;
+    const verification: "verified" | "divergence" = retcodeOk && priceOk && volumeOk ? "verified" : "divergence";
+    if (verification === "divergence") {
+      console.warn(
+        `[MT5Bridge] ⚠️ DIVERGENCIA request-vs-actual: retcode=${result.retcode} (ok=${retcodeOk}), price req=${order.price} real=${result.price} (ok=${priceOk}), volume req=${order.volume} real=${result.volume} (ok=${volumeOk})`
+      );
+    }
+    return { ...result, verification, guardChecks: guard.checks };
   },
 
   /**

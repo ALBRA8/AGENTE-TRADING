@@ -26,6 +26,7 @@ import { captureAutoError, buildLessonsContextBlock, extractJson } from "./self_
 import { saveDecision } from "../database/sqlite.js";
 import { getAccountRisk } from "./risk_controls.js";
 import { MT5Bridge } from "../config/mt5bridge.js";
+import { assertExecutionForDecision, initialApprovalStatus } from "./policy.js";
 
 // ── Tipos ───────────────────────────────────────────────────
 export type GateStatus = "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
@@ -240,11 +241,14 @@ async function stageAnalysts(symbol: string, timeframe: string, onProgress?: Pip
   }
 
   // Gate de noticias (fail-closed: sin filtro operativo → UNKNOWN)
+  // PROMPT 06 §6: el mensaje de error de runTool es "... no disponible: ..."
+  // en minúsculas — debe mapear a UNKNOWN, nunca caer al GREEN por defecto
+  // (hallazgo 9-b: gates news/dxy/price_feed eran fail-open ante tool crash).
   if (news.includes("🔴 BLOQUEADO")) {
     gates.push(gate("RED", "news", news.split("\n").find((l) => l.includes("BLOQUEADO"))?.trim() ?? "Evento de alto impacto"));
   } else if (news.includes("🟡 PRECAUCIÓN")) {
     gates.push(gate("YELLOW", "news", "Riesgo moderado → riesgo reducido a 0.25% y doble confirmación"));
-  } else if (news.includes("⚠️ Error") || news.includes("NO DISPONIBLE")) {
+  } else if (news.includes("⚠️ Error") || news.includes("NO DISPONIBLE") || news.includes("no disponible")) {
     gates.push(gate("UNKNOWN", "news", "Tavily no disponible → sin filtro de noticias (bloquea EXECUTE)"));
   } else {
     gates.push(gate("GREEN", "news", "Sin eventos de alto impacto"));
@@ -262,17 +266,20 @@ async function stageAnalysts(symbol: string, timeframe: string, onProgress?: Pip
   // Gate DXY (correlación) — sin feed real → UNKNOWN (no simular divergencia)
   if (dxy.includes("Divergencia")) {
     gates.push(gate("YELLOW", "dxy", "Divergencia DXY → exigir doble confirmación de ChoCh"));
-  } else if (dxy.includes("NO DISPONIBLE") || dxy.includes("NO VERIFICADA")) {
+  } else if (dxy.includes("NO DISPONIBLE") || dxy.includes("NO VERIFICADA") || dxy.includes("no disponible")) {
     gates.push(gate("UNKNOWN", "dxy", "Correlación DXY sin feed real → no verificada"));
   } else {
     gates.push(gate("GREEN", "dxy", dxy.includes("Correlación Sana") ? "Correlación DXY sana" : "DXY sin señal relevante"));
   }
 
   // Gate de datos SMC (informativo; precio real viene del bridge)
+  // Fail-closed (9-b): cualquier indicio de indisponibilidad o STALENESS →
+  // UNKNOWN. "DATOS STALE" lo emite analyze_market cuando smc/live detecta
+  // velas viejas (mercado cerrado/feed muerto) — §6 Market Data = Verdad.
   gates.push(
-    smc.includes("Error de Bridge") || smc.includes("Error de Datos")
-      ? gate("UNKNOWN", "price_feed", "Precio real no disponible desde el bridge")
-      : gate("GREEN", "price_feed", "Precio real disponible vía MT5")
+    smc.includes("Error de Bridge") || smc.includes("Error de Datos") || smc.includes("no disponible") || smc.includes("DATOS STALE")
+      ? gate("UNKNOWN", "price_feed", "Precio/estructura no disponible u obsoleta (stale) desde el feed")
+      : gate("GREEN", "price_feed", "Precio real disponible vía MT5 (fresco)")
   );
 
   return { gates, reports: { hours, news, dxy, rvol, smc } };
@@ -622,6 +629,30 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
       plan = { ...plan, riskPct: 0.25 };
     }
 
+    // ── POLICY CHECK (PROMPT 06 §1/§6/§12/§19) — capa obligatoria del pipeline:
+    // la gobernanza (kill switch / modo / nivel efectivo / aprobación) decide
+    // si un EXECUTE puede convertirse en orden. Si no → degrada a WAIT con
+    // la razón registrada. Se persiste el veredicto + status de aprobación.
+    let approvalStatus: string | null = null;
+    let policyResult: string | null = null;
+    if (finalAction === "EXECUTE") {
+      approvalStatus = initialApprovalStatus();
+      const policyVerdict = assertExecutionForDecision(approvalStatus);
+      policyResult = `${policyVerdict.allowed ? "ALLOWED" : "BLOCKED"} · L${policyVerdict.effectiveLevel} · ${policyVerdict.reason}`;
+      if (!policyVerdict.allowed) {
+        finalAction = "WAIT";
+        abortReason = `POLICY bloquea EXECUTE: ${policyVerdict.reason}`;
+        plan = plan ? { ...plan, action: "WAIT" } : plan;
+      }
+      if (policyVerdict.allowed) {
+        opts.onProgress?.(`🏛️ Policy OK: ${policyVerdict.reason}`);
+      } else {
+        opts.onProgress?.(`🏛️ Policy bloquea la ejecución: ${policyVerdict.reason}`);
+      }
+    } else {
+      policyResult = `N/A (${finalAction})`;
+    }
+
     const latencyMs = Date.now() - t0;
     const decisionId = saveDecision({
       userId: opts.userId,
@@ -638,6 +669,8 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
       reasoning: abortReason ?? plan?.reasoning ?? undefined,
       tokensUsed: tokens,
       latencyMs,
+      approvalStatus: approvalStatus ?? undefined,
+      policyResult: policyResult ?? undefined,
     });
 
     // ── Flip de bias: pendientes del agente en dirección opuesta al bias

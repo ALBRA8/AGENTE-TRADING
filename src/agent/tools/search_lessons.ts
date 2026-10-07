@@ -1,21 +1,30 @@
 import type { Tool } from "../types.js";
-import { searchLessons, promoteLesson, setLessonValidation } from "../../database/sqlite.js";
+import { searchLessons } from "../../database/sqlite.js";
 
 interface SearchLessonsArgs {
   keyword?: string;
   symbol?: string;
-  promoteId?: number;
-  validateId?: number;
-  status?: "pending" | "verified" | "unresolved" | "contradicted";
 }
 
+/**
+ * Task 10-c (gate §3/§4 del auditor 9-i): este tool era el choke point de la
+ * VIOLACIÓN de promoción — el LLM podía auto-validar (validateId) y
+ * auto-promover (promoteId) una lección en una misma sesión, convirtiendo UN
+ * trade en regla permanente del system prompt. Ambas acciones fueron
+ * RETIRADAS del alcance del LLM:
+ *   - Validación: solo código determinista (consolidateMemory, con stats
+ *     Wilson sobre decision_log settled).
+ *   - Promoción: solo promoteLessonGated (consolidation.ts) con evidencia +
+ *     evento auditado en policy_events. Sin tool que la exponga.
+ * El tool queda SOLO DE BÚSQUEDA/LECTURA.
+ */
 export const searchLessonsTool: Tool = {
   definition: {
     type: "function",
     function: {
       name: "searchLessons",
       description:
-        "Consulta las LECCIONES aprendidas por el agente (memoria de errores y aciertos). Permite buscar por palabra clave o activo, y también promover una lección a memoria permanente o cambiar su estado de validación.",
+        "Consulta las LECCIONES aprendidas por el agente (memoria de errores y aciertos). SOLO LECTURA: busca por palabra clave o activo. NO permite promover ni cambiar el estado de validación: la validación es estadística (consolidación determinista) y la promoción está gated con aprobación humana y auditoría.",
       parameters: {
         type: "object",
         properties: {
@@ -26,19 +35,6 @@ export const searchLessonsTool: Tool = {
           symbol: {
             type: "string",
             description: "Filtrar por activo (ej. US30)."
-          },
-          promoteId: {
-            type: "number",
-            description: "ID de lección a PROMOVER a memoria permanente (viajará siempre en el system prompt)."
-          },
-          validateId: {
-            type: "number",
-            description: "ID de lección cuyo estado de validación se quiere cambiar."
-          },
-          status: {
-            type: "string",
-            enum: ["pending", "verified", "unresolved", "contradicted"],
-            description: "Nuevo estado de validación para validateId."
           }
         }
       }
@@ -46,19 +42,9 @@ export const searchLessonsTool: Tool = {
   },
 
   async execute(args: Record<string, unknown>): Promise<string> {
-    const { keyword, symbol, promoteId, validateId, status } = args as unknown as SearchLessonsArgs;
+    const { keyword, symbol } = args as unknown as SearchLessonsArgs;
 
-    // Acciones de mantenimiento
-    if (promoteId) {
-      promoteLesson(promoteId, true);
-      return `⭐ Lección #${promoteId} promovida a memoria permanente. Viajará en el system prompt de todas las sesiones.`;
-    }
-    if (validateId && status) {
-      setLessonValidation(validateId, status);
-      return `✅ Lección #${validateId} actualizada a estado "${status}".`;
-    }
-
-    // Búsqueda
+    // Búsqueda (solo lectura)
     const lessons = searchLessons(keyword, symbol, 15);
     if (lessons.length === 0) {
       return "📭 No hay lecciones registradas" + (keyword || symbol ? " para ese criterio." : " todavía. Usa reflectOnTrade cuando ocurra un error o aprendizaje.");
@@ -81,7 +67,7 @@ export const searchLessonsTool: Tool = {
       "",
       ...lines,
       "",
-      "_⭐ = promovida (siempre en el system prompt) · usa promoteId/validateId para mantenimiento._",
+      "_⭐ = promovida (siempre en el system prompt) · La validación/promoción NO está disponible para el modelo: es un gate determinista con auditoría (§3/§4)._",
     ].join("\n");
   }
 };

@@ -251,11 +251,16 @@ function calculateMetricsByHour(trades: Trade[]): Record<number, HourMetrics> {
   return metrics;
 }
 
-/** Simulación Monte Carlo */
+/** Simulación Monte Carlo
+ *  rng inyectable (Task 10-b, §7 reproducibilidad): el motor pasa un PRNG
+ *  sembrado (mulberry32) para que la misma seed + mismos trades den SIEMPRE
+ *  el mismo resultado. Además el shuffle original `sort(() => Math.random()-0.5)`
+ *  estaba SESGADO (no produce permutaciones uniformes) → Fisher-Yates real. */
 export function monteCarloSimulation(
   trades: Trade[],
   config: BacktestConfig,
-  iterations: number = 10000
+  iterations: number = 10000,
+  rng: () => number = Math.random
 ): MonteCarloResult {
   const initialBalance = config.initialBalance;
   const tradePnL = trades.map((t) => t.profit);
@@ -266,8 +271,15 @@ export function monteCarloSimulation(
   const profitable: boolean[] = [];
 
   for (let i = 0; i < iterations; i++) {
-    // Desordenar trades aleatoriamente
-    const shuffled = [...tradePnL].sort(() => Math.random() - 0.5);
+    // Desordenar trades aleatoriamente: Fisher-Yates con el PRNG inyectado
+    // (permutación uniforme, determinista si rng está sembrado)
+    const shuffled = [...tradePnL];
+    for (let j = shuffled.length - 1; j > 0; j--) {
+      const k = Math.floor(rng() * (j + 1));
+      const tmp = shuffled[j];
+      shuffled[j] = shuffled[k];
+      shuffled[k] = tmp;
+    }
 
     let equity = initialBalance;
     let peak = initialBalance;

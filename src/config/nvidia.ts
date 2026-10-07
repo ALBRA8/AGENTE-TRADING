@@ -38,9 +38,91 @@ export const MODEL_TIERS = {
 
 export type ModelTier = keyof typeof MODEL_TIERS;
 
+// ── PROVIDER MOCK (PROMPT 06 §16 — provider contract) ─────────────
+// LLM_PROVIDER=mock activa un proveedor DETERMINISTA sin red: no llama a
+// NVIDIA, devuelve fixtures según marcadores del prompt (§25 E2E).
+//
+// ⚠️  SOLO SIRVE PARA E2E/TESTS. JAMÁS usarlo en producción: sus respuestas
+//     son afirmaciones fabricadas (bias/plan/veredicto fijos), no análisis.
+// FAIL-SAFE (§16): si LIVE_TRADING=true el mock se RECHAZA (error) — el
+// trading real exige el provider real; nunca inferir autoridad del mock.
+export function isMockProvider(): boolean {
+  return (process.env.LLM_PROVIDER ?? "").trim().toLowerCase() === "mock";
+}
+
+const MOCK_TOKENS = 42; // número pequeño fijo: el mock no consume tokens reales
+
+function mockCompletion(opts: {
+  tier: ModelTier;
+  system: string;
+  user: string;
+}): { content: string; tokensUsed: number } {
+  const system = opts.system ?? "";
+  const user = opts.user ?? "";
+
+  // Debate: posturas por marcador en el USER prompt (texto plano corto)
+  if (user.includes("POSTURA: TORO")) {
+    return {
+      content:
+        "TORO: La estructura es alcista según el reporte SMC (BOS confirmado y retroceso a POI con volumen institucional). " +
+        "El horario está en killzone y el RVOL respalda el impulso. El riesgo admite mi tesis: si pierde el POI, el plan queda invalidado.",
+      tokensUsed: MOCK_TOKENS,
+    };
+  }
+  if (user.includes("POSTURA: OSO")) {
+    return {
+      content:
+        "OSO: El alegado BOS puede ser un barrido de liquidez; el retroceso aún no muestra reacción confirmada. " +
+        "Sin confirmación de ChoCh en M1/M5 el movimiento es frágil, y la correlación DXY no está verificada. Admito que la estructura mayor es alcista.",
+      tokensUsed: MOCK_TOKENS,
+    };
+  }
+
+  // JSON por marcador en el SYSTEM prompt. ORDEN IMPORTANTE: el system del
+  // planner cita "veredicto del Research Manager" → Trade Planner se evalúa
+  // ANTES que Research Manager para no cruzar los fixtures.
+  if (system.includes("Trade Planner")) {
+    return {
+      content: JSON.stringify({
+        action: "EXECUTE",
+        direction: "BUY",
+        stopLossPips: 15,
+        riskPct: 0.5,
+        setup: "choch",
+        reasoning: "Plan del mock",
+      }),
+      tokensUsed: MOCK_TOKENS,
+    };
+  }
+  if (system.includes("Research Manager")) {
+    return {
+      content: JSON.stringify({
+        bias: "BULLISH",
+        confidence: 0.8,
+        conditions: ["ChoCh M5 confirmado"],
+        rationale: "Estructura real detectada",
+      }),
+      tokensUsed: MOCK_TOKENS,
+    };
+  }
+  if (system.includes("riesgo") || system.includes("Analista de riesgo")) {
+    return {
+      content: JSON.stringify({ verdict: "OK", concern: "mock sin objeciones" }),
+      tokensUsed: MOCK_TOKENS,
+    };
+  }
+
+  // Fallback: JSON válido (fail-closed río abajo: los parseadores deciden)
+  return {
+    content: JSON.stringify({ verdict: "OK", concern: "mock" }),
+    tokensUsed: MOCK_TOKENS,
+  };
+}
+
 /**
  * Llamada de chat no-streaming por tier, con retry incluido.
  * Devuelve el texto final y el uso de tokens reportado por la API.
+ * LLM_PROVIDER=mock → fixtures deterministas sin red (§16/§25).
  */
 export async function callLLMByTier(opts: {
   tier: ModelTier;
@@ -50,6 +132,19 @@ export async function callLLMByTier(opts: {
   temperature?: number;
   jsonMode?: boolean;
 }): Promise<{ content: string; tokensUsed: number }> {
+  // ── Provider mock (§16): fixture determinista, sin NVIDIA ──
+  if (isMockProvider()) {
+    // Fail-safe: trading real nunca sobre un proveedor de fixtures.
+    if ((process.env.LIVE_TRADING ?? "").trim().toLowerCase() === "true") {
+      throw new Error(
+        "[NVIDIA] LLM_PROVIDER=mock está PROHIBIDO con LIVE_TRADING=true " +
+          "(§16 fail-safe): el trading real exige el proveedor real. " +
+          "Desactiva LIVE_TRADING o cambia LLM_PROVIDER."
+      );
+    }
+    return mockCompletion(opts);
+  }
+
   const model = MODEL_TIERS[opts.tier];
   const resp: any = await withRetry(
     () =>

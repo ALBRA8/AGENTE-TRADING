@@ -13,6 +13,12 @@ import { analyzeLiveStructure } from "../../smc/live.js";
  *  - Killzone NY con timezone real America/New_York (DST-safe): misma
  *    técnica que check_market_hours.ts — se replica aquí porque ese
  *    archivo no exporta helpers y está fuera del alcance de esta tarea.
+ * Task 10-a (§6 Market Data = Verdad):
+ *  - Si el feed está rancio (analysis.dataStale de live.ts) se añade un
+ *    bloque visible "⚠️ DATOS STALE" — el texto exacto lo reconoce el gate
+ *    price_feed del pipeline y lo trata como UNKNOWN (fail-closed).
+ *  - Cada afirmación del reporte lleva su fuente: [OBSERVED] para precios
+ *    medidos, [INFERRED] para lo derivado por el detector.
  */
 
 interface AnalyzeMarketArgs {
@@ -92,11 +98,20 @@ export const analyzeMarket: Tool = {
     }
 
     // 3. Tick en vivo (complementario, no crítico: ya hay cierre real de vela)
-    let tickLine = `Último cierre: **${analysis.lastPrice}** (${analysis.candleCount} velas hasta ${analysis.asOf})`;
+    //    Task 10-a: precio marcado [OBSERVED] + edad del tick (hallazgo 9-b P2:
+    //    antes se mostraba Bid/Ask sin edad — un tick viejo parecía "actual").
+    let tickLine = `Último cierre [OBSERVED]: **${analysis.lastPrice}** (${analysis.candleCount} velas CERRADAS hasta ${analysis.asOf})`;
+    if (!analysis.lastCandleClosed) {
+      tickLine += ` · vela en curso EXCLUIDA del análisis`;
+    }
     try {
       const tick = await MT5Bridge.getPrice(symbol);
       if (Number.isFinite(tick.bid) && Number.isFinite(tick.ask) && tick.bid > 0 && tick.ask > 0) {
-        tickLine += ` · Bid **${tick.bid}** / Ask **${tick.ask}** (spread ${tick.spread})`;
+        const tMs = new Date(tick.time ?? "").getTime();
+        const ageStr = Number.isFinite(tMs)
+          ? `, hace ${Math.max(0, Math.round((Date.now() - tMs) / 1000))}s`
+          : "";
+        tickLine += ` · Bid/Ask [OBSERVED]: **${tick.bid}** / **${tick.ask}** (spread ${tick.spread}${ageStr})`;
       }
     } catch {
       tickLine += ` · _tick en vivo no disponible (el análisis usa el cierre real de vela)_`;
@@ -109,11 +124,21 @@ export const analyzeMarket: Tool = {
 
     // 5. Reporte de estructura real (generado por smc/live con números reales)
     const decisionLine = analysis.setupValid
-      ? "🟢 Setup válido según detector — la decisión (EXECUTE/WAIT) la toma el pipeline con sus gates y comité, NO este reporte."
-      : "🟡 Sin setup válido ahora — no hay base estructural para sugerir ejecución.";
+      ? "🟢 Setup válido según detector [INFERRED — derivado de velas OBSERVED] — la decisión (EXECUTE/WAIT) la toma el pipeline con sus gates y comité, NO este reporte."
+      : "🟡 Sin setup válido ahora [INFERRED — ausencia de estructura confirmada] — no hay base estructural para sugerir ejecución.";
+
+    // Task 10-a (§6): feed rancio → bloque visible. Textos exactos que el
+    // gate price_feed reconoce: "DATOS STALE" y "no disponible" → UNKNOWN.
+    const staleBlock = analysis.dataStale
+      ? [
+          `⚠️ **DATOS STALE** — ${analysis.staleReason ?? "frescura del feed no verificable"}`,
+          `⛔ Fuente de precio/estructura tratada como no disponible para decisiones: los gates del pipeline marcan price_feed UNKNOWN (fail-closed).`,
+        ]
+      : [];
 
     return [
       analysis.reportText,
+      ...(staleBlock.length ? ["", ...staleBlock] : []),
       "",
       `🛡️ **Filtros de sesión**: ${killzoneStr}`,
       `💰 **Precio**: ${tickLine}`,

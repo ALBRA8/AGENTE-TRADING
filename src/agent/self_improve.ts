@@ -18,7 +18,7 @@
 // ============================================================
 
 import { callLLMByTier } from "../config/nvidia.js";
-import {
+import db, {
   saveLesson,
   saveAutoError,
   getUnresolvedErrors,
@@ -153,9 +153,52 @@ async function distillLesson(
 // ── API pública ─────────────────────────────────────────────
 
 /**
+ * MemoryDV (Task 10-c): columnas añadidas a agent_lessons por el orquestador
+ * (sqlite.ts, NO editables desde aquí) que saveLesson aún no escribe.
+ * Este enricher las persiste con un UPDATE propio tras el saveLesson.
+ * Es la extensión mínima acordada en 9-i: 0 churn en lectores existentes.
+ */
+function enrichLessonMemory(
+  lessonId: number,
+  dv: {
+    memoryType?: string;
+    truthLevel?: string;
+    confidence?: number;
+    evidence?: Record<string, unknown>;
+  }
+): void {
+  if (!lessonId) return;
+  try {
+    db.prepare(
+      `UPDATE agent_lessons SET
+         memory_type = COALESCE(?, memory_type),
+         truth_level = COALESCE(?, truth_level),
+         confidence  = COALESCE(?, confidence),
+         evidence_json = CASE
+           WHEN ? IS NOT NULL THEN ?
+           ELSE evidence_json END
+       WHERE id = ?`
+    ).run(
+      dv.memoryType ?? null,
+      dv.truthLevel ?? null,
+      dv.confidence ?? null,
+      dv.evidence ? JSON.stringify(dv.evidence).slice(0, 1_500) : null,
+      dv.evidence ? JSON.stringify(dv.evidence).slice(0, 1_500) : null,
+      lessonId
+    );
+  } catch (err) {
+    console.warn(`[SelfImprove] MemoryDV enrich falló para #${lessonId}: ${(err as Error).message}`);
+  }
+}
+
+/**
  * Reflexión post-trade / post-error (llamada por el tool reflectOnTrade).
  * Si el resultado contradice una lección verificada existente, la marca
  * como 'contradicted' (revalidación por causa, no por antigüedad).
+ *
+ * Task 10-c (MemoryDV §9): acepta metadatos de evidencia — el settlement
+ * pasa decision_id/PnL/fuente con truth_level='OBSERVED' (PnL cerrado es
+ * un hecho observado, no una inferencia del LLM).
  */
 export async function reflectOnExperience(input: {
   symbol?: string;
@@ -164,6 +207,10 @@ export async function reflectOnExperience(input: {
   errorMade?: string;
   userNote?: string;
   source?: LessonRow["source"];
+  evidence?: Record<string, unknown>;
+  truthLevel?: string;
+  memoryType?: string;
+  confidence?: number;
 }): Promise<{ saved: boolean; deduped: boolean; lessonId?: number; lessonText?: string }> {
   const parts: string[] = [];
   if (input.symbol) parts.push(`Activo: ${input.symbol}`);
@@ -200,6 +247,14 @@ export async function reflectOnExperience(input: {
     importance: distilled.importance,
   });
 
+  // MemoryDV: persistir evidencia + tipo de memoria + confianza (si vienen).
+  enrichLessonMemory(id, {
+    memoryType: input.memoryType,
+    truthLevel: input.truthLevel,
+    confidence: input.confidence,
+    evidence: input.evidence,
+  });
+
   // Revalidación por contradicción: si el trade fue GANADOR y existe una
   // lección verificada que decía lo contrario para esta causa, queda en duda.
   if (
@@ -220,10 +275,41 @@ export async function reflectOnExperience(input: {
 }
 
 /**
+ * GATE de contexto (Task 10-c, cierra la violación §3 del 9-i):
+ * UNA sola operación (1 trade → 1 lección pendiente) ya NO influye en la
+ * siguiente decisión. Reglas:
+ *   - Promovidas: SIEMPRE entran (la promoción es un acto auditado y
+ *     determinista vía promoteLessonGated — ver consolidation.ts — jamás
+ *     invocable por el LLM).
+ *   - Lecciones operativas (OPS| / source='auto_error'): entran como antes;
+ *     su triage ya exigía ≥3 ocurrencias recurrentes del error.
+ *   - Lecciones de TRADING (reflection/user): requieren times_seen ≥ 3
+ *     (patrón observado, no anécdota) para entrar al contexto.
+ * NOTA: getLessonsForContext vive en sqlite.ts (no editable en 10-c); el
+ * filtro se aplica AQUÍ, en el único choke point de inyección al pipeline.
+ */
+export const MIN_TIMES_SEEN_FOR_CONTEXT = 3;
+
+export function isContextEligible(l: LessonRow): boolean {
+  if (l.promoted === 1) return true;
+  if (l.source === "auto_error" || l.pattern_key.startsWith("OPS|")) return true;
+  return l.times_seen >= MIN_TIMES_SEEN_FOR_CONTEXT;
+}
+
+/**
+ * REUSO: lecciones elegibles para inyectar en el pipeline antes de decidir.
+ * Aplica el gate de recurrencia sobre getLessonsForContext (orden interno
+ * promovidas > verificadas > pendientes se mantiene).
+ */
+export function getContextEligibleLessons(symbol?: string, limit = 8): LessonRow[] {
+  return getLessonsForContext(symbol, limit * 3).filter(isContextEligible).slice(0, limit);
+}
+
+/**
  * REUSO: bloque de lecciones para inyectar en el pipeline antes de decidir.
  */
 export function buildLessonsContextBlock(symbol?: string): string {
-  const lessons = getLessonsForContext(symbol, 8);
+  const lessons = getContextEligibleLessons(symbol, 8);
   if (lessons.length === 0) return "";
 
   const lines = lessons.map((l, i) => {

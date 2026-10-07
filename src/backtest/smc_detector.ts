@@ -11,6 +11,14 @@ import {
   SMCSetup,
 } from "./types.js";
 
+/**
+ * Lookback de confirmación de swings (compartido con simulator.ts).
+ * detectSwingPoints confirma cada swing con las 5 velas FUTURAS (i+1..i+5):
+ * un swing en s3.index NO es operable hasta s3.index + SWING_LOOKBACK.
+ * Entrar antes = look-ahead estructural (hallazgo grave del auditor 9-g).
+ */
+export const SWING_LOOKBACK = 5;
+
 /** Procesa velas crudas a formato con cálculos */
 export function processCandles(candles: any[]): ProcessedCandle[] {
   return candles.map((c, i) => {
@@ -24,6 +32,10 @@ export function processCandles(candles: any[]): ProcessedCandle[] {
     const wickTop = high - Math.max(open, close);
     const wickBottom = Math.min(open, close) - low;
 
+    // Nota (Task 10-b): se arrastra `spread` de RawCandle porque el simulador
+    // lo necesita para la fricción por trade. El campo no está declarado en
+    // ProcessedCandle (types.ts fuera del alcance de esta tarea) → aserción
+    // documentada; lectura vía cast en simulator.ts.
     return {
       time: new Date(c.time),
       open,
@@ -36,7 +48,8 @@ export function processCandles(candles: any[]): ProcessedCandle[] {
       wickTop,
       wickBottom,
       range: high - low,
-    };
+      spread: typeof c.spread === "number" ? c.spread : 0,
+    } as ProcessedCandle;
   });
 }
 
@@ -82,9 +95,16 @@ export function detectFVGs(candles: ProcessedCandle[]): FVG[] {
     }
   }
 
-  // Mark mitigated FVGs
+  // Marcar FVGs mitigados.
+  // FIX (auditoría 9-g, hallazgo "FVG nace mitigado"): el bucle arrancaba en
+  // `i = fvg.endIndex` y la vela FINAL del propio FVG cumple su condición de
+  // contacto (su low/high está dentro de la zona por construcción) → TODO FVG
+  // nacía isMitigated=true → con requireFVG=true el backtest devolvía 0 trades.
+  // Semántica SMC estándar: "mitigado" = el precio VOLVIÓ a la zona DESPUÉS de
+  // que el gap se formara ⇒ escanear desde endIndex+1 (mismo criterio que ya
+  // aplicaba src/smc/live.ts::recomputeFvgMitigation por su cuenta).
   for (const fvg of fvgs) {
-    for (let i = fvg.endIndex; i < candles.length; i++) {
+    for (let i = fvg.endIndex + 1; i < candles.length; i++) {
       if (fvg.type === "BULLISH") {
         // Mitigated if price goes into the gap
         if (candles[i].low <= fvg.top && candles[i].low >= fvg.bottom) {
@@ -170,8 +190,9 @@ export function detectStructureShifts(
     const s2 = swings[i - 1]; // reciente
     const s3 = swings[i]; // actual
 
-    // Calcular RVOL para este movimiento
-    const recentVolume = volumes.slice(s2.index - 5, s2.index + 1);
+    // Calcular RVOL para este movimiento (clamp: s2.index < 5 → slice con
+    // índice negativo envuelve y produce ventanas absurdas / NaN)
+    const recentVolume = volumes.slice(Math.max(0, s2.index - 5), s2.index + 1);
     const avgVolume = recentVolume.reduce((a, b) => a + b, 0) / recentVolume.length || 1;
     const currentVolume = volumes[s2.index] || avgVolume;
     const rvol = avgVolume > 0 ? currentVolume / avgVolume : 1;
@@ -230,20 +251,40 @@ export function detectStructureShifts(
       }
     }
 
-    // Change of Character (ChoCh) - Reversión
-    // ALCISTA: ChoCh en tendencia bajista
-    if (
-      s0.type === "HIGH" && // Secuencia en tendencia bajista
-      s1.type === "LOW" &&
-      s2.type === "HIGH" &&
-      s3.type === "LOW"
-    ) {
-      // ChoCh alcista: s3 rompe s1 hacia abajo
-      const isChoCh = s3.price < s1.price;
-      // Verificar que estaba bajista (LH + LL)
-      const wasBearish = s2.price < s0.price;
+    // ── Change of Character (ChoCh) — CAMBIO REAL de carácter ──
+    //
+    // FIX (auditoría 9-g, hallazgo "ChoCh invertido y duplicado"): los dos
+    // bloques originales usaban comparadores INVERTIDOS (el "ChoCh BULLISH"
+    // disparaba cuando s3 rompía un low HACIA ABAJO y el "ChoCh BEARISH" al
+    // romper hacia arriba), con condiciones idénticas a las del BOS → en la
+    // misma ventana se emitían BOS BULLISH + "ChoCh BEARISH" simultáneos y
+    // contradictorios.
+    //
+    // Semántica correcta (ChoCh = ruptura CONTRARIA al carácter previo):
+    //  • ChoCh ALCISTA (reversión AL alza): el carácter previo era BAJISTA
+    //    (s2 < s0 → lower-low dentro de la ventana) y el precio rompe s1
+    //    HACIA ARRIBA (s3, un swing high, > s1, el último lower-high).
+    //  • ChoCh BAJISTA (reversión a la baja): carácter previo ALCISTA
+    //    (s2 > s0 → higher-high dentro de la ventana) y el precio rompe s1
+    //    HACIA ABAJO (s3, un swing low, < s1, el último higher-low).
+    //
+    // La ventana de tipos es la misma que la del BOS de su dirección, pero la
+    // condición de carácter previo es la OPUESTA → BOS y ChoCh quedan
+    // mutuamente excluyentes (BOS = continuación; ChoCh = reversión).
 
-      if (isChoCh && wasBearish) {
+    // ChoCh ALCISTA: tras secuencia bajista (LL), ruptura AL ALZA del último lower-high
+    if (
+      s0.type === "LOW" &&
+      s1.type === "HIGH" &&
+      s2.type === "LOW" &&
+      s3.type === "HIGH"
+    ) {
+      // Carácter previo BAJISTA: s2 hizo un lower-low respecto a s0
+      const wasBearish = s2.price < s0.price;
+      // Reversión al alza: s3 (swing high) rompe HACIA ARRIBA el último high (s1)
+      const breaksUp = s3.price > s1.price;
+
+      if (wasBearish && breaksUp) {
         setups.push({
           index: s3.index,
           time: s3.time,
@@ -257,19 +298,19 @@ export function detectStructureShifts(
       }
     }
 
-    // ChoCh BAJISTA
+    // ChoCh BAJISTA: tras secuencia alcista (HH), ruptura A LA BAJA del último higher-low
     if (
-      s0.type === "LOW" && // Secuencia en tendencia alcista
-      s1.type === "HIGH" &&
-      s2.type === "LOW" &&
-      s3.type === "HIGH"
+      s0.type === "HIGH" &&
+      s1.type === "LOW" &&
+      s2.type === "HIGH" &&
+      s3.type === "LOW"
     ) {
-      // ChoCh bajista: s3 rompe s1 hacia arriba
-      const isChoCh = s3.price > s1.price;
-      // Verificar que estaba alcista (HH + HL)
+      // Carácter previo ALCISTA: s2 hizo un higher-high respecto a s0
       const wasBullish = s2.price > s0.price;
+      // Reversión a la baja: s3 (swing low) rompe HACIA ABAJO el último low (s1)
+      const breaksDown = s3.price < s1.price;
 
-      if (isChoCh && wasBullish) {
+      if (wasBullish && breaksDown) {
         setups.push({
           index: s3.index,
           time: s3.time,

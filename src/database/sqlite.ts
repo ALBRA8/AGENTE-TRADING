@@ -159,6 +159,38 @@ db.exec(`
     score       REAL NOT NULL,
     report_json TEXT NOT NULL
   );
+
+  -- ── PROMPT 06 §6/§19: policy_events — auditoría append-only de gobernanza ──
+  -- Cada cambio de modo/nivel/techo/kill-switch/aprobación queda registrado
+  -- con actor y razón. El estado vigente = último evento de cada clave.
+  CREATE TABLE IF NOT EXISTS policy_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    actor      TEXT NOT NULL,
+    event      TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT NOT NULL,
+    reason     TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_policy_events_key ON policy_events(event, id DESC);
+
+  -- ── PROMPT 06 §7: manifest de reproducibilidad de backtests ──
+  -- Un run sin manifest completo (data_hash/params/code_version/seed) es
+  -- INVALID / NOT REPRODUCIBLE y jamás alimenta decisiones ni lecciones.
+  CREATE TABLE IF NOT EXISTS backtest_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    run_id       TEXT NOT NULL UNIQUE,
+    engine       TEXT NOT NULL DEFAULT 'simulation',
+    symbol       TEXT,
+    data_hash    TEXT,
+    params_json  TEXT,
+    code_version TEXT,
+    seed         INTEGER,
+    verdict      TEXT NOT NULL DEFAULT 'INVALID_NOT_REPRODUCIBLE',
+    metrics_json TEXT
+  );
 `);
 
 // ── Migración ligera (idempotente): columnas de settlement ──
@@ -180,6 +212,57 @@ db.exec(`
   if (!cols.includes("outcome_timestamp")) {
     db.exec(`ALTER TABLE decision_log ADD COLUMN outcome_timestamp TEXT`);
   }
+  // ── PROMPT 06 §12: Approval Contract ──
+  if (!cols.includes("approval_status")) {
+    db.exec(`ALTER TABLE decision_log ADD COLUMN approval_status TEXT DEFAULT 'auto'`);
+  }
+  if (!cols.includes("policy_result")) {
+    db.exec(`ALTER TABLE decision_log ADD COLUMN policy_result TEXT`);
+  }
+  if (!cols.includes("take_profit_pips")) {
+    db.exec(`ALTER TABLE decision_log ADD COLUMN take_profit_pips REAL`);
+  }
+})();
+
+// ── Migración trade_orders: verificación de ejecución + contrato §12 ──
+(function migrateTradeOrders() {
+  const cols = (
+    db.pragma("table_info(trade_orders)") as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (!cols.includes("risk_amount")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN risk_amount REAL`);
+  }
+  if (!cols.includes("strategy")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN strategy TEXT`);
+  }
+  if (!cols.includes("expiration")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN expiration INTEGER`);
+  }
+  if (!cols.includes("verification_status")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN verification_status TEXT`);
+  }
+  if (!cols.includes("slippage")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN slippage REAL`);
+  }
+})();
+
+// ── Migración agent_lessons: campos MemoryDV (PROMPT 06 §9) ──
+// EPISODIC/SEMANTIC/PROCEDURAL/FACTUAL + evidencia + decay de utilidad.
+(function migrateAgentLessons() {
+  const cols = (
+    db.pragma("table_info(agent_lessons)") as Array<{ name: string }>
+  ).map((c) => c.name);
+  const add = (col: string, ddl: string) => {
+    if (!cols.includes(col)) db.exec(`ALTER TABLE agent_lessons ADD COLUMN ${ddl}`);
+  };
+  add("memory_type", "memory_type TEXT DEFAULT 'SEMANTIC'");
+  add("domain", "domain TEXT");
+  add("confidence", "confidence REAL");
+  add("truth_level", "truth_level TEXT DEFAULT 'INFERRED'");
+  add("evidence_json", "evidence_json TEXT");
+  add("last_verified", "last_verified TEXT");
+  add("utility", "utility REAL");
+  add("agent_id", "agent_id TEXT DEFAULT 'AGENTE-TRADING'");
 })();
 
 // Índice único para dedupe real de lecciones (la dedupe por SELECT+INSERT
@@ -320,6 +403,11 @@ export interface DecisionRow {
   outcome_settled?: number; // 0=pending, 1=settled, 2=expired/sin datos
   settle_attempts?: number;
   outcome_source?: string | null;
+  /* PROMPT 06 §12: Approval Contract */
+  consumed_at?: string | null;
+  approval_status?: "auto" | "pending" | "approved" | "rejected" | null;
+  policy_result?: string | null;
+  outcome_timestamp?: string | null;
 }
 
 export function saveDecision(d: {
@@ -338,13 +426,16 @@ export function saveDecision(d: {
   reasoning?: string;
   tokensUsed?: number;
   latencyMs?: number;
+  approvalStatus?: string;
+  policyResult?: string;
 }): number {
   const res = db
     .prepare(
       `INSERT INTO decision_log
         (user_id, symbol, timeframe, final_action, direction, entry_price, stop_loss_pips,
-         risk_pct, confidence, gates_json, reports_json, debate_json, reasoning, tokens_used, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         risk_pct, confidence, gates_json, reports_json, debate_json, reasoning, tokens_used, latency_ms,
+         approval_status, policy_result)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       d.userId ?? null,
@@ -361,7 +452,9 @@ export function saveDecision(d: {
       d.debateJson ?? null,
       d.reasoning ?? null,
       d.tokensUsed ?? 0,
-      d.latencyMs ?? 0
+      d.latencyMs ?? 0,
+      d.approvalStatus ?? null,
+      d.policyResult ?? null
     );
   return Number(res.lastInsertRowid);
 }
@@ -668,6 +761,11 @@ export interface TradeOrderRow {
   ticket?: number | null;
   risk_pct?: number | null;
   status: string;
+  risk_amount?: number | null;
+  strategy?: string | null;
+  expiration?: number | null;
+  verification_status?: string | null;
+  slippage?: number | null;
 }
 
 export function saveOrder(o: {
@@ -682,12 +780,17 @@ export function saveOrder(o: {
   ticket?: number;
   riskPct?: number;
   status?: string;
+  riskAmount?: number | null;
+  strategy?: string | null;
+  expiration?: number | null;
+  verificationStatus?: string | null;
 }): number {
   const res = db
     .prepare(
       `INSERT INTO trade_orders
-        (decision_id, symbol, direction, order_type, volume, entry_price, stop_loss, take_profit, ticket, risk_pct, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (decision_id, symbol, direction, order_type, volume, entry_price, stop_loss, take_profit, ticket, risk_pct, status,
+         risk_amount, strategy, expiration, verification_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       o.decisionId ?? null,
@@ -700,7 +803,11 @@ export function saveOrder(o: {
       o.takeProfit ?? null,
       o.ticket ?? null,
       o.riskPct ?? null,
-      o.status ?? "placed"
+      o.status ?? "placed",
+      o.riskAmount ?? null,
+      o.strategy ?? null,
+      o.expiration ?? null,
+      o.verificationStatus ?? null
     );
   return Number(res.lastInsertRowid);
 }
@@ -798,6 +905,91 @@ export function getConsecutiveLosses(): number {
     else break;
   }
   return streak;
+}
+
+// ── Policy Engine (PROMPT 06 §6/§9/§12/§19) ────────────────
+// Eventos append-only de gobernanza. El estado vigente es el ÚLTIMO
+// evento de cada clave. Nada de UPDATE sobre historia.
+
+export function recordPolicyEvent(
+  actor: string,
+  event: string,
+  oldValue: string | null | undefined,
+  newValue: string,
+  reason?: string
+): void {
+  db.prepare(
+    `INSERT INTO policy_events (actor, event, old_value, new_value, reason)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(actor, event, oldValue ?? null, newValue, reason ?? null);
+}
+
+/** Último evento de cada clave solicitada: { clave: {value, reason, created_at} } */
+export function getLatestPolicyValues(
+  keys: string[]
+): Record<string, { value: string; reason?: string; created_at: string }> {
+  const out: Record<string, { value: string; reason?: string; created_at: string }> = {};
+  for (const key of keys) {
+    const row = db
+      .prepare(
+        `SELECT new_value, reason, created_at FROM policy_events
+         WHERE event = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(key) as { new_value: string; reason: string | null; created_at: string } | undefined;
+    if (row) out[key] = { value: row.new_value, reason: row.reason ?? undefined, created_at: row.created_at };
+  }
+  return out;
+}
+
+export function getPolicyEventsHistory(limit = 50): Array<{
+  id: number; created_at: string; actor: string; event: string;
+  old_value: string | null; new_value: string; reason: string | null;
+}> {
+  return db
+    .prepare(`SELECT * FROM policy_events ORDER BY id DESC LIMIT ?`)
+    .all(limit) as any[];
+}
+
+/** ¿La decisión ya produjo una orden REAL (no demo)? — dedup del guard. */
+export function hasPlacedOrderForDecision(decisionId: number): boolean {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM trade_orders
+       WHERE decision_id = ? AND status IN ('placed', 'verified', 'divergence')`
+    )
+    .get(decisionId) as { n: number };
+  return row.n > 0;
+}
+
+// ── Manifest de reproducibilidad de backtests (PROMPT 06 §7) ──
+
+export function saveBacktestRunManifest(m: {
+  runId: string;
+  engine?: string;
+  symbol?: string;
+  dataHash?: string;
+  paramsJson?: string;
+  codeVersion?: string;
+  seed?: number;
+  verdict?: string;
+  metricsJson?: string;
+}): void {
+  db.prepare(
+    `INSERT INTO backtest_runs (run_id, engine, symbol, data_hash, params_json, code_version, seed, verdict, metrics_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(run_id) DO UPDATE SET
+       verdict = excluded.verdict, metrics_json = excluded.metrics_json`
+  ).run(
+    m.runId,
+    m.engine ?? "simulation",
+    m.symbol ?? null,
+    m.dataHash ?? null,
+    m.paramsJson ?? null,
+    m.codeVersion ?? null,
+    m.seed ?? null,
+    m.verdict ?? "INVALID_NOT_REPRODUCIBLE",
+    m.metricsJson ?? null
+  );
 }
 
 export default db;

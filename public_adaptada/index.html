@@ -49,6 +49,31 @@
     .tr-spark { display: flex; align-items: flex-end; gap: 3px; height: 44px; margin-top: 8px; }
     .tr-spark i { flex: 1; min-height: 3px; border-radius: 2px 2px 0 0; background: linear-gradient(180deg, #4f8cff, #2dd4a7); }
     .tr-spark i.down { background: linear-gradient(180deg, #e05c5c, #7a2f2f); }
+    /* PROMPT 06 §9/§19/§20/§5: gobernanza (badge + kill switch), Doctor y Skills */
+    .gov-badge {
+      display: inline-block; margin-left: 8px; padding: 2px 10px;
+      border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .4px;
+      vertical-align: middle; background: rgba(79, 140, 255, 0.12); color: #9db9ff;
+      border: 1px solid rgba(79,140,255,.3);
+    }
+    .gov-badge.kill { background: rgba(224, 92, 92, 0.18); color: #ff8f8f; border-color: rgba(224,92,92,.45); animation: pulse 2s infinite; }
+    .kill-btn {
+      margin-left: 10px; padding: 4px 12px; font-size: 11px; font-weight: 700;
+      border-radius: 8px; cursor: pointer; vertical-align: middle;
+      background: rgba(224, 92, 92, 0.1); color: #ff8f8f;
+      border: 1px solid rgba(224,92,92,.4); transition: background .2s;
+    }
+    .kill-btn:hover { background: rgba(224, 92, 92, 0.25); }
+    .kill-btn.armed { background: rgba(224, 92, 92, 0.3); color: #fff; }
+    .gov-notice {
+      margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; font-size: 12.5px;
+      background: rgba(245, 185, 66, 0.1); color: #f5b942; border: 1px solid rgba(245,185,66,.3);
+    }
+    .dr-grid { display: grid; grid-template-columns: 240px 1fr; gap: 12px; }
+    @media (max-width: 900px) { .dr-grid { grid-template-columns: 1fr; } }
+    .dr-seccion { margin-bottom: 10px; }
+    .dr-seccion b { font-size: 13px; }
+    .dr-check { font-size: 12px; opacity: .8; padding: 2px 0 2px 18px; }
     @media (max-width: 900px) { .tr-grid { grid-template-columns: repeat(2, 1fr); } }
   </style>
 </head>
@@ -72,6 +97,12 @@
         <a href="#" class="nav-item" id="nav-trackrecord" data-view="trackrecord">
           <i class="icon">🏆</i> Track Record
         </a>
+        <a href="#" class="nav-item" id="nav-doctor" data-view="doctor">
+          <i class="icon">🩺</i> Doctor
+        </a>
+        <a href="#" class="nav-item" id="nav-skills" data-view="skills">
+          <i class="icon">🧩</i> Skills
+        </a>
         <a href="#" class="nav-item" id="nav-performance" data-view="brain">
           <i class="icon">📈</i> Performance
         </a>
@@ -89,7 +120,7 @@
       <!-- Topbar -->
       <header class="topbar">
         <div class="topbar-info">
-          <h2 id="view-title">Analista Senior SMC<span id="mode-badge" class="mode-badge demo" title="Modo operativo: DEMO no ejecuta órdenes reales">DEMO</span></h2>
+          <h2 id="view-title">Analista Senior SMC<span id="mode-badge" class="mode-badge demo" title="Modo operativo: DEMO no ejecuta órdenes reales">DEMO</span><span id="gov-badge" class="gov-badge" hidden title="Gobernanza PROMPT 06: modo · nivel efectivo/techo · kill switch"></span><button id="kill-btn" class="kill-btn" type="button" title="Kill switch global (§9): corta toda orden desde cualquier interfaz">🛑 Kill</button></h2>
           <p id="view-subtitle">Bridge MT5 local (bridge.py) | NVIDIA NIM: nemotron-3-super-120b-a12b + llama-3.3-70b-instruct</p>
         </div>
       </header>
@@ -134,6 +165,16 @@
       <!-- Vista Track Record (Task 8-b: la vitrina del producto) -->
       <div class="chat-wrapper brain-view" id="trackrecord-view" hidden>
         <div id="trackrecord-content"></div>
+      </div>
+
+      <!-- Vista Doctor (PROMPT 06 §20: diagnóstico de 9 secciones) -->
+      <div class="chat-wrapper brain-view" id="doctor-view" hidden>
+        <div id="doctor-content"></div>
+      </div>
+
+      <!-- Vista Skills (PROMPT 06 §5: contrato declarativo de capacidades) -->
+      <div class="chat-wrapper brain-view" id="skills-view" hidden>
+        <div id="skills-content"></div>
       </div>
 
       <!-- Settings / Reasoning View (Hidden by default) -->

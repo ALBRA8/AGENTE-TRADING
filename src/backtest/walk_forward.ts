@@ -6,11 +6,17 @@
 
 import type { BacktestResult, BacktestConfig, RawCandle, WFAWindow, WFAResult } from "./types.js";
 import { BacktestEngine } from "./engine.js";
-import { MetricsCalculator } from "./metrics.js";
+// FIX (auditoría 9-g, "walk-forward muerto"): este módulo importaba
+// `MetricsCalculator`, que nunca existió en metrics.ts → el import crasheaba
+// y arrastraba consigo TODO el barrel backtest (index.js). Las métricas se
+// consumen directamente de los BacktestResult que devuelve el engine
+// (calculateMetrics ya corre dentro de engine.runBacktest).
 
 interface WFAOptions {
   // Tamaño de ventana de entrenamiento (ej: 6 meses)
-  trainWindow: "1M" | "3M" | "6M" | "1Y";
+  // ("1W"/"2W" añadidos: parseTimeWindow ya los soportaba; útiles para
+  //  datasets cortos y tests — Task 10-b)
+  trainWindow: "1W" | "2W" | "1M" | "3M" | "6M" | "1Y";
   // Tamaño de ventana de prueba (ej: 2 meses)
   testWindow: "1W" | "2W" | "1M" | "2M";
   // Cuánto overlap entre ventanas (0 = no overlap, 0.5 = 50%)
@@ -38,11 +44,15 @@ interface OptimizedParams {
 
 export class WalkForwardAnalyzer {
   private engine: BacktestEngine;
-  private metricsCalc: MetricsCalculator;
 
   constructor() {
-    this.engine = new BacktestEngine({ enableMonteCarlo: false });
-    this.metricsCalc = new MetricsCalculator();
+    // maxCandlesToProcess = MAX_SAFE_INTEGER: FIX (9-g) — el default 5000 del
+    // engine TRUNCABA silenciosamente las ventanas train (6M M15 ≈ 8.600 velas
+    // → solo se entrenaba con la cola). El WFA necesita la ventana completa.
+    this.engine = new BacktestEngine({
+      enableMonteCarlo: false,
+      maxCandlesToProcess: Number.MAX_SAFE_INTEGER,
+    });
   }
 
   /**
@@ -58,6 +68,13 @@ export class WalkForwardAnalyzer {
     options: WFAOptions
   ): Promise<WFAResult> {
     const windows = this.generateWindows(candles, options);
+    if (windows.length === 0) {
+      // Fail-closed honesto: antes analyzeWFAResults crasheaba con reduce de
+      // array vacío si el dataset no alcanzaba para una ventana.
+      throw new Error(
+        "WFA: 0 ventanas generables con el dataset proporcionado (amplía el rango o reduce trainWindow/testWindow)"
+      );
+    }
     const results: WFAWindow[] = [];
 
     console.log(`\n🔄 Walk-Forward Analysis: ${windows.length} ventanas`);
@@ -69,6 +86,15 @@ export class WalkForwardAnalyzer {
       console.log(`\n📊 Ventana ${i + 1}/${windows.length}`);
       console.log(`   Train: ${w.trainStart.toLocaleDateString()} → ${w.trainEnd.toLocaleDateString()}`);
       console.log(`   Test:  ${w.testStart.toLocaleDateString()} → ${w.testEnd.toLocaleDateString()}`);
+
+      // Verificación anti-solape (§7): train y test de una misma ventana NO
+      // comparten ni una vela — testStart === trainEnd y los filtros son
+      // medio-abiertos. Si esto se violara, el OOS estaría contaminado.
+      if (w.testStart.getTime() < w.trainEnd.getTime()) {
+        throw new Error(
+          `WFA: solape train/test detectado en la ventana ${i + 1} — resultado inválido`
+        );
+      }
 
       // Fase 1: Optimización en train data
       console.log("   [1/3] Optimizando parámetros...");
@@ -221,7 +247,13 @@ export class WalkForwardAnalyzer {
       }
     }
 
-    return bestParams!;
+    if (!bestParams) {
+      // Fail-closed: ninguna combinación produjo un score numérico válido
+      throw new Error(
+        "WFA: ninguna combinación de parámetros produjo un score válido en la ventana de train"
+      );
+    }
+    return bestParams;
   }
 
   /**

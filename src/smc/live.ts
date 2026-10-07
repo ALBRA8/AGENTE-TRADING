@@ -63,6 +63,18 @@ export interface LiveAnalysis {
   pois: LivePOI[];
   setupValid: boolean;
   confidence: number;
+  /** §6 verdad de datos (Task 10-a): feed rancio = (now − asOf) > 3×TF */
+  dataStale: boolean;
+  staleReason?: string;
+  /** true si la última vela de la serie YA CERRÓ (la vela en curso se excluye) */
+  lastCandleClosed: boolean;
+  /** Taxonomía de verdad §6: qué es observado directo y qué es inferencia */
+  truthLevels: {
+    candles: "OBSERVED";
+    structure: "OBSERVED";
+    trend: "INFERRED";
+    setup: "INFERRED";
+  };
   reportText: string;
 }
 
@@ -71,6 +83,21 @@ export interface LiveAnalysis {
 /** Timeframes aceptados por el bridge (ver TIMEFRAME_MAP en bridge.py) */
 const SUPPORTED_TIMEFRAMES = new Set(["M1", "M5", "M15", "H1"]);
 const CANDLES_TO_FETCH = 200;
+/** Minutos por timeframe — base de frescura (3×TF) y vela-en-curso */
+const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, H1: 60 };
+
+/**
+ * Niveles de verdad §6 del análisis en vivo (Task 10-a): las velas y la
+ * estructura detectada sobre ellas son OBSERVED (medidas del feed/detector);
+ * la tendencia y la validez del setup son INFERRED (derivadas de lo anterior).
+ * Constante, no parametrizable: la fuente NO se decide en runtime.
+ */
+const LIVE_TRUTH_LEVELS: LiveAnalysis["truthLevels"] = {
+  candles: "OBSERVED",
+  structure: "OBSERVED",
+  trend: "INFERRED",
+  setup: "INFERRED",
+};
 /**
  * Mínimo de velas para analizar: el detector usa lookback 5 a cada lado
  * para swings y necesita ≥4 swings para estructuras; con menos de 60 velas
@@ -249,8 +276,20 @@ function buildReport(
 ): string {
   const lines: string[] = [];
   lines.push(`📊 **Estructura SMC EN VIVO — ${a.symbol} (${a.timeframe})**`);
+  lines.push(`• Fuente: velas MT5 [OBSERVED] · tendencia [INFERRED — derivada de estructura]`);
   lines.push(`• Tendencia: **${a.trend}** — ${trendBasis}`);
-  lines.push(`• Último precio: **${a.lastPrice}** · ${a.candleCount} velas hasta ${a.asOf}`);
+  lines.push(`• Último precio: **${a.lastPrice}** · ${a.candleCount} velas CERRADAS hasta ${a.asOf}`);
+
+  // Nota de vela en curso (Task 10-a): la exclusión evita BOS/FVG fantasma
+  if (!a.lastCandleClosed) {
+    lines.push(`• Nota: última vela EN CURSO EXCLUIDA del análisis (solo velas cerradas)`);
+  }
+
+  // Datos rancios (hallazgo 9-b P2): feed muerto/mercado cerrado → visible
+  // y explícito. El texto exacto "DATOS STALE" lo reconoce el gate price_feed.
+  if (a.dataStale) {
+    lines.push(`⚠️ **DATOS STALE** — ${a.staleReason ?? "frescura no verificable"} (los gates tratarán esto como UNKNOWN)`);
+  }
 
   const lastSwings = a.swings.slice(-6);
   lines.push(
@@ -304,12 +343,15 @@ function buildReport(
 /**
  * Analiza la estructura SMC del símbolo con las velas REALES del bridge.
  * Si se inyectan `candles` (tests / reuso), se usan esas en lugar del bridge.
- * Fail-closed: bridge caído o velas insuficientes → available:false.
+ * `opts.now` inyecta el reloj (tests): base de frescura y vela-en-curso.
+ * Fail-closed: bridge caído, velas insuficientes o throw del detector →
+ * available:false con razón honesta (§6: nunca analizar con datos a medias).
  */
 export async function analyzeLiveStructure(
   symbol: string,
   timeframe: string,
-  candles?: MT5Candle[]
+  candles?: MT5Candle[],
+  opts?: { now?: Date }
 ): Promise<LiveAnalysis> {
   const sym = symbol.trim().toUpperCase();
   const tf = timeframe.trim().toUpperCase();
@@ -329,6 +371,10 @@ export async function analyzeLiveStructure(
     pois: [],
     setupValid: false,
     confidence: 0,
+    dataStale: false,
+    staleReason: undefined,
+    lastCandleClosed: false,
+    truthLevels: LIVE_TRUTH_LEVELS,
     reportText: `❌ **Estructura SMC no disponible para ${sym} (${tf})**: ${reason}`,
   });
 
@@ -356,99 +402,154 @@ export async function analyzeLiveStructure(
       Number.isFinite(c.low) && Number.isFinite(c.close) &&
       c.high >= c.low
   );
-  if (clean.length < MIN_CANDLES) {
-    return unavailable(`Velas insuficientes: ${clean.length} (mínimo ${MIN_CANDLES})`);
-  }
-
-  // 3. Pipeline SMC con las funciones REALES del detector de backtest
-  const processed: ProcessedCandle[] = processCandles(
-    clean.map((c) => ({
-      time: c.time,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      tickVolume: c.tickVolume,
-      realVolume: c.realVolume,
-      spread: c.spread,
-    }))
-  );
-  const volumes = processed.map((c) => c.tickVolume || 0);
-  const swings: SwingPoint[] = detectSwingPoints(processed);
-  const setups: SMCSetup[] = detectStructureShifts(processed, swings, volumes);
-  const fvgs: FVG[] = recomputeFvgMitigation(detectFVGs(processed), processed);
-  const associated = associateCorrectedFvgs(setups, fvgs);
-
-  // 4. Setup válido según las reglas del detector (RVOL del SOP; killzone
-  //    NO se exige aquí — la valida el gate de horario del pipeline).
-  //    Se acepta el setup más reciente que cumpla: con el detector real,
-  //    cada ventana emite BOS y ChoCh emparejados y solo uno de ellos
-  //    lleva FVG asociado del mismo sentido.
-  const setupConfig = { requireFVG: true, requireKillzone: false, rvolThreshold: SOP_RVOL_THRESHOLD };
-  const validSetups = associated.filter((s) => isValidSetup(s, setupConfig, new Date()));
-  const lastSetup = associated[associated.length - 1] ?? null;
-  const lastValid = validSetups[validSetups.length - 1] ?? null;
-  const setupValid = validSetups.length > 0;
-
-  // 5. Tendencia y confianza derivadas de la estructura (no inventadas)
-  const structureShifts: LiveStructureShift[] = setups.map((s) => ({
-    type: s.type as "BOS" | "ChoCh",
-    direction: s.direction,
-    price: s.price,
-    time: s.time,
-    candleIndex: s.index,
-    confidence: s.confidence,
-    rvol: s.rvol,
-  }));
-  const { trend, basis } = deriveTrend(setups, swings);
-
-  let confidence = 0;
-  if (trend !== "UNKNOWN") {
-    if (lastValid) {
-      confidence = lastValid.confidence; // 0-1 (rvol/2; ChoCh ×0.8)
-    } else if (lastSetup) {
-      confidence = lastSetup.confidence * 0.5; // estructura sin confirmación de volumen/FVG
-    } else {
-      confidence = 0.2; // tendencia inferida solo de swings, sin shift
+  // 2b. Frescura y vela en curso (Task 10-a, hallazgos 9-b P2):
+  //  - La vela SIN CERRAR se EXCLUYE del análisis: un BOS/FVG sobre una vela
+  //    que aún puede cambiar es estructura fantasma. Regla: la vela de
+  //    apertura T cierra en T + TF; si now cae dentro de ese intervalo
+  //    (y la vela ya abrió), está en curso.
+  //  - STALE: si (now − última vela cerrada) > 3×TF el feed está muerto o el
+  //    mercado cerrado → dataStale=true (el análisis sigue disponible pero
+  //    marcado; el gate price_feed lo tratará como UNKNOWN).
+  const tfMinutes = TF_MINUTES[tf] ?? 0;
+  const nowMs = (opts?.now ?? new Date()).getTime();
+  let series = clean;
+  let lastCandleClosed = true;
+  if (tfMinutes > 0 && series.length > 0) {
+    const lastOpenMs = new Date(series[series.length - 1].time).getTime();
+    const inProgress =
+      Number.isFinite(lastOpenMs) &&
+      nowMs >= lastOpenMs && // la vela ya abrió
+      nowMs < lastOpenMs + tfMinutes * 60_000; // y aún no cierra
+    if (inProgress) {
+      series = series.slice(0, -1);
+      lastCandleClosed = false;
     }
   }
-  confidence = Math.round(Math.min(1, Math.max(0, confidence)) * 100) / 100;
 
-  // 6. POIs: order blocks derivados de los shifts + FVGs NO mitigados
-  const orderBlocks = deriveOrderBlocks(setups, processed);
-  const unmitigatedFvgs: LivePOI[] = fvgs
-    .filter((f) => !f.isMitigated)
-    .map((f) => ({
-      kind: "FVG" as const,
-      direction: f.type,
-      top: f.top,
-      bottom: f.bottom,
-      candleIndex: f.endIndex,
-      time: f.endTime,
-      mitigated: false,
-      origin: `FVG velas ${f.startIndex}→${f.endIndex}`,
+  // El mínimo aplica a velas CERRADAS (lo que realmente se analiza)
+  if (series.length < MIN_CANDLES) {
+    return unavailable(
+      `Velas insuficientes: ${series.length} cerradas (mínimo ${MIN_CANDLES})` +
+        (!lastCandleClosed ? " tras excluir la vela en curso" : "")
+    );
+  }
+
+  let dataStale = false;
+  let staleReason: string | undefined;
+  if (tfMinutes > 0) {
+    const lastClosedMs = new Date(series[series.length - 1].time).getTime();
+    if (Number.isFinite(lastClosedMs)) {
+      const ageMin = (nowMs - lastClosedMs) / 60_000;
+      if (ageMin > tfMinutes * 3) {
+        dataStale = true;
+        staleReason = `última vela de hace ${Math.round(ageMin)} min (TF ${tf}); mercado cerrado o feed muerto`;
+      }
+    }
+  }
+
+  // 3. Pipeline SMC con las funciones REALES del detector de backtest.
+  //    Hallazgo 9-b P1: TODO el pipeline del detector va envuelto en
+  //    try/catch — cualquier throw de un edge-case se convierte en
+  //    unavailable honesto y JAMÁS en un GREEN que el pipeline interpretaría
+  //    como "precio real disponible".
+  try {
+    const processed: ProcessedCandle[] = processCandles(
+      series.map((c) => ({
+        time: c.time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        tickVolume: c.tickVolume,
+        realVolume: c.realVolume,
+        spread: c.spread,
+      }))
+    );
+    const volumes = processed.map((c) => c.tickVolume || 0);
+    const swings: SwingPoint[] = detectSwingPoints(processed);
+    const setups: SMCSetup[] = detectStructureShifts(processed, swings, volumes);
+    const fvgs: FVG[] = recomputeFvgMitigation(detectFVGs(processed), processed);
+    const associated = associateCorrectedFvgs(setups, fvgs);
+
+    // 4. Setup válido según las reglas del detector (RVOL del SOP; killzone
+    //    NO se exige aquí — la valida el gate de horario del pipeline).
+    //    Se acepta el setup más reciente que cumpla: con el detector real,
+    //    cada ventana emite BOS y ChoCh emparejados y solo uno de ellos
+    //    lleva FVG asociado del mismo sentido.
+    const setupConfig = { requireFVG: true, requireKillzone: false, rvolThreshold: SOP_RVOL_THRESHOLD };
+    const validSetups = associated.filter((s) => isValidSetup(s, setupConfig, new Date()));
+    const lastSetup = associated[associated.length - 1] ?? null;
+    const lastValid = validSetups[validSetups.length - 1] ?? null;
+    const setupValid = validSetups.length > 0;
+
+    // 5. Tendencia y confianza derivadas de la estructura (no inventadas)
+    const structureShifts: LiveStructureShift[] = setups.map((s) => ({
+      type: s.type as "BOS" | "ChoCh",
+      direction: s.direction,
+      price: s.price,
+      time: s.time,
+      candleIndex: s.index,
+      confidence: s.confidence,
+      rvol: s.rvol,
     }));
-  const pois = [...orderBlocks, ...unmitigatedFvgs];
+    const { trend, basis } = deriveTrend(setups, swings);
 
-  const last = processed[processed.length - 1];
-  const analysis: Omit<LiveAnalysis, "reportText" | "available" | "unavailableReason"> = {
-    symbol: sym,
-    timeframe: tf,
-    trend,
-    lastPrice: last.close,
-    candleCount: processed.length,
-    asOf: last.time.toISOString(),
-    swings,
-    structureShifts,
-    fvgs,
-    pois,
-    setupValid,
-    confidence,
-  };
+    let confidence = 0;
+    if (trend !== "UNKNOWN") {
+      if (lastValid) {
+        confidence = lastValid.confidence; // 0-1 (rvol/2; ChoCh ×0.8)
+      } else if (lastSetup) {
+        confidence = lastSetup.confidence * 0.5; // estructura sin confirmación de volumen/FVG
+      } else {
+        confidence = 0.2; // tendencia inferida solo de swings, sin shift
+      }
+    }
+    confidence = Math.round(Math.min(1, Math.max(0, confidence)) * 100) / 100;
 
-  return {
-    ...analysis,
-    available: true,
-    reportText: buildReport(analysis, basis),
-  };
+    // 6. POIs: order blocks derivados de los shifts + FVGs NO mitigados
+    const orderBlocks = deriveOrderBlocks(setups, processed);
+    const unmitigatedFvgs: LivePOI[] = fvgs
+      .filter((f) => !f.isMitigated)
+      .map((f) => ({
+        kind: "FVG" as const,
+        direction: f.type,
+        top: f.top,
+        bottom: f.bottom,
+        candleIndex: f.endIndex,
+        time: f.endTime,
+        mitigated: false,
+        origin: `FVG velas ${f.startIndex}→${f.endIndex}`,
+      }));
+    const pois = [...orderBlocks, ...unmitigatedFvgs];
+
+    const last = processed[processed.length - 1];
+    const analysis: Omit<LiveAnalysis, "reportText" | "available" | "unavailableReason"> = {
+      symbol: sym,
+      timeframe: tf,
+      trend,
+      lastPrice: last.close,
+      candleCount: processed.length,
+      asOf: last.time.toISOString(),
+      swings,
+      structureShifts,
+      fvgs,
+      pois,
+      setupValid,
+      confidence,
+      dataStale,
+      staleReason,
+      lastCandleClosed,
+      truthLevels: LIVE_TRUTH_LEVELS,
+    };
+
+    return {
+      ...analysis,
+      available: true,
+      reportText: buildReport(analysis, basis),
+    };
+  } catch (err) {
+    // §6: un bug del detector nunca debe degradarse a un análisis
+    // aparentemente sano — unavailable con la causa real.
+    return unavailable(`Error del detector SMC: ${(err as Error).message}`);
+  }
 }
