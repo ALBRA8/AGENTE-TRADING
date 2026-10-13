@@ -25,8 +25,9 @@
 //      + alert() con JSON compacto (concatenación, sin str.format: las llaves
 //      {..} se interpretan como placeholders y rompen el JSON) y
 //      alert.freq_once_per_bar_close.
-//   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), líneas
-//      proyectadas 25 barras con labels de precio (SL, TP1, TP2, TP3).
+//   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), línea de
+//      ENTRADA punteada gris + niveles proyectados proj_bars velas (20 por
+//      defecto, como el script del usuario) con labels de precio.
 //   7. Archivo compañero: zarus30_v2_strategy.pine (la evidencia de backtest).
 //   8. GRÁFICO LIMPIO (Task 11-e): por defecto SOLO se muestra el último setup
 //      (los niveles SL/TP de señales anteriores se borran solos); el histórico
@@ -72,6 +73,7 @@ string session_str = input.session("0000-0000", "Sesión permitida (hora del exc
 // Legibilidad del gráfico (Task 11-e)
 bool clean_chart = input.bool(true, "Solo el último setup (borra niveles de señales anteriores)")
 bool show_levels = input.bool(true, "Proyectar niveles SL/TP1/TP2/TP3")
+int  proj_bars   = input.int(20, "Proyección Líneas (Velas)", minval=5, maxval=100, group="Visualización")
 
 // Zonas de interés SMC (Task 11-f): OB por ruptura de estructura + FVG opcional
 bool  show_ob     = input.bool(true,  "Zonas OB (compra/venta)", group="Zonas de Interés (SMC)")
@@ -314,12 +316,13 @@ if (buy_signal or sell_signal) and clean_chart
     while array.size(lvl_labels) > 0
         label.delete(array.pop(lvl_labels))
 
-// Señal + niveles proyectados 25 barras (SL/TP1/TP2/TP3).
+// Señal + niveles proyectados proj_bars velas (entrada punteada + SL/TP1/TP2/TP3).
 // Solo se ejecutan UNA vez (vela confirmada del flip) -> sin repintado.
 if buy_signal
     label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
     if show_levels
-        int x2 = bar_index + 25
+        int x2 = bar_index + proj_bars
+        array.push(lvl_lines, line.new(bar_index, entry_price, x2, entry_price, color=color.gray, width=1, style=line.style_dotted))
         array.push(lvl_lines, line.new(bar_index, sl_price, x2, sl_price, color=color.new(color.red, 0), width=2))
         array.push(lvl_lines, line.new(bar_index, tp1_price, x2, tp1_price, color=color.new(color.teal, 25), width=1))
         array.push(lvl_lines, line.new(bar_index, tp2_price, x2, tp2_price, color=color.new(color.teal, 25), width=1))
@@ -331,7 +334,8 @@ if buy_signal
 if sell_signal
     label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
     if show_levels
-        int x2s = bar_index + 25
+        int x2s = bar_index + proj_bars
+        array.push(lvl_lines, line.new(bar_index, entry_price, x2s, entry_price, color=color.gray, width=1, style=line.style_dotted))
         array.push(lvl_lines, line.new(bar_index, sl_price, x2s, sl_price, color=color.new(color.red, 0), width=2))
         array.push(lvl_lines, line.new(bar_index, tp1_price, x2s, tp1_price, color=color.new(color.teal, 25), width=1))
         array.push(lvl_lines, line.new(bar_index, tp2_price, x2s, tp2_price, color=color.new(color.teal, 25), width=1))
