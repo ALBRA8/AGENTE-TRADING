@@ -106,6 +106,9 @@
         <a href="#" class="nav-item" id="nav-performance" data-view="brain">
           <i class="icon">📈</i> Performance
         </a>
+        <a href="#" class="nav-item" id="nav-pine">
+          <i class="icon">📊</i> Pine TradingView
+        </a>
       </nav>
 
       <div class="agent-status">
@@ -205,6 +208,91 @@
     <strong>Herramienta educativa y de análisis — no es asesoría financiera.</strong>
     Operar apalancado puede suponer la <strong>pérdida total de tu capital</strong>. Resultados pasados no garantizan resultados futuros. Modo DEMO por defecto.
   </footer>
+
+  <!-- Task 11-c: modal flotante con el código Pine listo para copiar/pegar -->
+  <div id="pine-modal" class="pine-overlay" hidden>
+    <div class="pine-window" role="dialog" aria-modal="true" aria-label="Código Pine para TradingView">
+      <div class="pine-head">
+        <h3>📊 Código Pine — TradingView</h3>
+        <button id="pine-close" class="pine-x" title="Cerrar">✕</button>
+      </div>
+      <div class="pine-tabs">
+        <button class="pine-tab active" data-pine="indicador">Indicador (señales)</button>
+        <button class="pine-tab" data-pine="estrategia">Strategy (backtest)</button>
+      </div>
+      <pre id="pine-code" class="pine-code">Cargando…</pre>
+      <div class="pine-foot">
+        <span class="pine-hint">TradingView → Pine Editor → pegar → Guardar → Añadir al gráfico. Señal impresa solo al cierre de vela (sin repintado).</span>
+        <button id="pine-copy" class="pine-copy">📋 Copiar código</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task 11-c: lógica del modal Pine (autocontenida) -->
+  <script>
+    (function () {
+      var overlay = document.getElementById('pine-modal');
+      var pre = document.getElementById('pine-code');
+      var copyBtn = document.getElementById('pine-copy');
+      var navPine = document.getElementById('nav-pine');
+      if (!overlay || !pre || !copyBtn || !navPine) return;
+      var current = 'indicador';
+      var cache = {};
+
+      function load(name) {
+        pre.textContent = 'Cargando…';
+        if (cache[name]) { pre.textContent = cache[name]; return; }
+        fetch('/api/pine/' + name).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }).then(function (d) {
+          cache[name] = d.code || '';
+          pre.textContent = cache[name];
+        }).catch(function () {
+          pre.textContent = '// No se pudo cargar el código. Verifica que el servidor esté corriendo.';
+        });
+      }
+      function open() { overlay.hidden = false; load(current); }
+      function close() { overlay.hidden = true; }
+
+      navPine.addEventListener('click', function (e) { e.preventDefault(); open(); });
+      document.getElementById('pine-close').addEventListener('click', close);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) close(); });
+
+      Array.prototype.forEach.call(document.querySelectorAll('.pine-tab'), function (tab) {
+        tab.addEventListener('click', function () {
+          Array.prototype.forEach.call(document.querySelectorAll('.pine-tab'), function (t) { t.classList.remove('active'); });
+          tab.classList.add('active');
+          current = tab.getAttribute('data-pine') || 'indicador';
+          load(current);
+        });
+      });
+
+      copyBtn.addEventListener('click', function () {
+        var text = pre.textContent || '';
+        function done() {
+          copyBtn.textContent = '✅ Copiado';
+          setTimeout(function () { copyBtn.textContent = '📋 Copiar código'; }, 1800);
+        }
+        function fallback() {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); done(); } catch (err) {}
+          document.body.removeChild(ta);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(fallback);
+        } else {
+          fallback();
+        }
+      });
+    })();
+  </script>
 
   <script src="app.js"></script>
 </body>

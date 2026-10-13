@@ -415,3 +415,66 @@ body {
   0%, 80%, 100% { transform: scale(0); }
   40% { transform: scale(1); }
 }
+
+/* ── Task 11-c: modal flotante Pine (código TradingView listo para copiar) ── */
+.pine-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(4, 8, 18, 0.72);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.pine-overlay[hidden] { display: none; }
+.pine-window {
+  width: min(880px, 100%); max-height: 86vh;
+  display: flex; flex-direction: column; gap: 12px;
+  background: rgba(13, 18, 32, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+.pine-head { display: flex; align-items: center; justify-content: space-between; }
+.pine-head h3 { margin: 0; font-size: 15px; font-weight: 700; color: #e2e8f0; }
+.pine-x {
+  background: none; border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #94a3b8; border-radius: 8px; width: 28px; height: 28px;
+  cursor: pointer; font-size: 12px; line-height: 1;
+}
+.pine-x:hover { color: #fff; border-color: rgba(255, 255, 255, 0.3); }
+.pine-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.pine-tab {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #94a3b8; padding: 7px 14px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  transition: all 0.15s ease;
+}
+.pine-tab:hover { color: #e2e8f0; }
+.pine-tab.active {
+  background: rgba(0, 210, 255, 0.12);
+  border-color: rgba(0, 210, 255, 0.45);
+  color: #00d2ff;
+}
+.pine-code {
+  flex: 1; min-height: 220px; overflow: auto; margin: 0;
+  background: rgba(2, 6, 14, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-family: "SF Mono", "Cascadia Code", Consolas, Menlo, monospace;
+  font-size: 12px; line-height: 1.5;
+  color: #cbd5e1;
+  white-space: pre;
+  user-select: all;
+}
+.pine-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.pine-hint { font-size: 11px; opacity: 0.55; line-height: 1.4; }
+.pine-copy {
+  background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+  color: #041018; font-weight: 700;
+  border: none; border-radius: 10px;
+  padding: 9px 16px; font-size: 12.5px; cursor: pointer;
+  white-space: nowrap;
+}
+.pine-copy:hover { filter: brightness(1.1); }

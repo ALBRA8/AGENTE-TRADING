@@ -231,6 +231,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', (e) => {
       e.preventDefault();
+      if (item.id === 'nav-pine') return; // Task 11-c: el modal Pine lo gestiona su propio script
       document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
       item.classList.add('active');
       const view = item.dataset.view;

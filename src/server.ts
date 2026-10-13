@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import path from "path";
+import fs from "node:fs";
 import { fileURLToPath } from "url";
 import { runAgentLoop } from "./agent/loop.js";
 import db, { getRecentMessages } from "./database/sqlite.js";
@@ -135,6 +136,26 @@ export function startDashboard(port: number = 3000) {
       res.json(trackRecordCache.data);
     } catch (error) {
       fail(res, "trackrecord", error);
+    }
+  });
+
+  // ── API: Pine TradingView (Task 11-c) — código listo para copiar/pegar ──
+  // Whitelist estricta: solo los dos .pine de tradingview/. Lectura pública
+  // (no expone nada sensible; mismos criterios que /api/trackrecord).
+  const PINE_FILES: Record<string, string> = {
+    indicador: "zarus30_v2.pine",
+    estrategia: "zarus30_v2_strategy.pine",
+  };
+  app.get("/api/pine/:name", (req, res) => {
+    try {
+      const file = PINE_FILES[String(req.params.name ?? "").toLowerCase()];
+      if (!file) {
+        return res.status(404).json({ error: "Archivo Pine no encontrado. Usa 'indicador' o 'estrategia'." });
+      }
+      const code = fs.readFileSync(path.join(__dirname, "../tradingview", file), "utf8");
+      res.json({ filename: file, code });
+    } catch (error) {
+      fail(res, "pine", error);
     }
   });
 
