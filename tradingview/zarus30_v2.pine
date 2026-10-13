@@ -31,6 +31,9 @@
 //   8. GRÁFICO LIMPIO (Task 11-e): por defecto SOLO se muestra el último setup
 //      (los niveles SL/TP de señales anteriores se borran solos); el histórico
 //      de entradas queda como etiquetas pequeñas BUY/SELL. Toggles configurables.
+//   9. ZONAS SMC (Task 11-f): FVG inmaculados (cajas que persisten hasta
+//      mitigación por cierre o expiración) y marcas BOS/CHoCH por pivotes —
+//      detección solo con vela confirmada (mismo estándar no-repaint).
 //
 // CÓMO ACTIVAR LA ALERTA WEBHOOK (para el bot):
 //   1. Cargar este script en el gráfico del activo y TF deseados (M5/M15).
@@ -65,6 +68,14 @@ string session_str = input.session("0000-0000", "Sesión permitida (hora del exc
 // Legibilidad del gráfico (Task 11-e)
 bool clean_chart = input.bool(true, "Solo el último setup (borra niveles de señales anteriores)")
 bool show_levels = input.bool(true, "Proyectar niveles SL/TP1/TP2/TP3")
+
+// Zonas SMC (Task 11-f)
+bool  show_fvg     = input.bool(true,  "Mostrar FVG (zonas de interés)", group="Zonas SMC")
+int   max_fvg      = input.int(3,       "Máx. FVG activos por lado", minval=1, maxval=10, group="Zonas SMC")
+int   fvg_max_age  = input.int(150,     "Expiración FVG (barras)", minval=20, group="Zonas SMC")
+float fvg_min_atr  = input.float(0.1,   "Tamaño mín. FVG (× ATR)", minval=0.0, step=0.05, group="Zonas SMC")
+bool  show_bos     = input.bool(true,  "Marcas BOS / CHoCH", group="Zonas SMC")
+int   pivot_len    = input.int(5,       "Pivotes para estructura", minval=2, group="Zonas SMC")
 
 // --------------------------------------------- SL fijo según ticker (v2)
 // Detección del activo por ticker en un único bloque if/else if, ordenado de
@@ -159,6 +170,75 @@ if sell_signal
     tp1_price   := close - sl_points
     tp2_price   := close - 2.0 * sl_points
     tp3_price   := close - 3.0 * sl_points
+
+// ============================================================================
+// ZONAS SMC (Task 11-f): FVG inmaculados + BOS/CHoCH
+// Detección y mutación de estado SOLO en barstate.isconfirmed (no-repaint).
+//   - FVG alcista:  low > high[2]  -> zona [high[2], low]  (3 velas)
+//   - FVG bajista:  high < low[2]  -> zona [high, low[2]]
+//   - Mitigación por CIERRE a través de la zona (estándar inmaculado); el
+//     toque solo es el retest (la caja sigue viva = POI valida entrada).
+//   - Máx. cajas por lado + expiración: gráfico siempre legible.
+// ============================================================================
+float ph = ta.pivothigh(pivot_len, pivot_len)
+float pl = ta.pivotlow(pivot_len, pivot_len)
+var float swing_hi   = na
+var float swing_lo   = na
+var int   struct_dir = 1
+
+var array<box>   fvg_bull     = array.new<box>()
+var array<box>   fvg_bear     = array.new<box>()
+var array<float> fvg_bull_bot = array.new<float>()
+var array<float> fvg_bear_top = array.new<float>()
+var array<int>   fvg_bull_bar = array.new<int>()
+var array<int>   fvg_bear_bar = array.new<int>()
+
+if barstate.isconfirmed
+    // ── Estructura: pivotes confirmados
+    if not na(ph)
+        swing_hi := ph
+    if not na(pl)
+        swing_lo := pl
+    // ── Mitigación / expiración de FVG (recorrido inverso para poder remove)
+    if array.size(fvg_bull) > 0
+        for i = array.size(fvg_bull) - 1 to 0
+            if close < array.get(fvg_bull_bot, i) or bar_index - array.get(fvg_bull_bar, i) > fvg_max_age
+                box.delete(array.get(fvg_bull, i))
+                array.remove(fvg_bull, i)
+                array.remove(fvg_bull_bot, i)
+                array.remove(fvg_bull_bar, i)
+    if array.size(fvg_bear) > 0
+        for i = array.size(fvg_bear) - 1 to 0
+            if close > array.get(fvg_bear_top, i) or bar_index - array.get(fvg_bear_bar, i) > fvg_max_age
+                box.delete(array.get(fvg_bear, i))
+                array.remove(fvg_bear, i)
+                array.remove(fvg_bear_top, i)
+                array.remove(fvg_bear_bar, i)
+    // ── Nuevos FVG (hueco de 3 velas con tamaño mínimo configurable)
+    if show_fvg and low > high[2] and (low - high[2]) >= fvg_min_atr * atr_val
+        array.push(fvg_bull, box.new(bar_index - 1, low, bar_index + 5, high[2], border_color=color.new(color.teal, 55), border_width=1, bgcolor=color.new(color.teal, 82), extend=extend.right))
+        array.push(fvg_bull_bot, high[2])
+        array.push(fvg_bull_bar, bar_index)
+        if array.size(fvg_bull) > max_fvg
+            box.delete(array.shift(fvg_bull))
+            array.shift(fvg_bull_bot)
+            array.shift(fvg_bull_bar)
+    if show_fvg and high < low[2] and (low[2] - high) >= fvg_min_atr * atr_val
+        array.push(fvg_bear, box.new(bar_index - 1, low[2], bar_index + 5, high, border_color=color.new(color.red, 55), border_width=1, bgcolor=color.new(color.red, 84), extend=extend.right))
+        array.push(fvg_bear_top, low[2])
+        array.push(fvg_bear_bar, bar_index)
+        if array.size(fvg_bear) > max_fvg
+            box.delete(array.shift(fvg_bear))
+            array.shift(fvg_bear_top)
+            array.shift(fvg_bear_bar)
+    // ── BOS / CHoCH: primera vez que el CIERRE rompe un swing confirmado
+    //    (etiqueta en la vela de ruptura, sin spam: solo el cruce inicial)
+    if show_bos and not na(swing_hi) and close > swing_hi and close[1] <= swing_hi
+        label.new(bar_index, high, struct_dir == -1 ? "CHoCH" : "BOS", style=label.style_label_down, color=color.new(struct_dir == -1 ? color.orange : color.teal, 20), textcolor=color.white, size=size.tiny)
+        struct_dir := 1
+    if show_bos and not na(swing_lo) and close < swing_lo and close[1] >= swing_lo
+        label.new(bar_index, low, struct_dir == 1 ? "CHoCH" : "BOS", style=label.style_label_up, color=color.new(struct_dir == 1 ? color.orange : color.red, 20), textcolor=color.white, size=size.tiny)
+        struct_dir := -1
 
 // ----------------------------------------------------------------- Dibujo
 p_price = plot(hl2, display=display.none)
