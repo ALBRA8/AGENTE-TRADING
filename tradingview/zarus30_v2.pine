@@ -22,7 +22,9 @@
 //      / BTCUSD 500, detectada por ticker con str.contains y fallback a US30.
 //   4. SESIÓN/KILLZONE opcional (input.session, desactivada por defecto).
 //   5. ALERTAS: alertcondition() BUY/SELL con placeholders {{ticker}}/{{close}}
-//      + alert() con JSON compacto (str.format) y alert.freq_once_per_bar_close.
+//      + alert() con JSON compacto (concatenación, sin str.format: las llaves
+//      {..} se interpretan como placeholders y rompen el JSON) y
+//      alert.freq_once_per_bar_close.
 //   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), líneas
 //      proyectadas 25 barras con labels de precio (SL, TP1, TP2, TP3).
 //   7. Archivo compañero: zarus30_v2_strategy.pine (la evidencia de backtest).
@@ -187,13 +189,13 @@ if sell_signal
 alertcondition(buy_signal, "ZARUS30 v2 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
 alertcondition(sell_signal, "ZARUS30 v2 SELL", "ZARUS30 SELL {{ticker}} @ {{close}} (senal al cierre de vela)")
 
-// alert() con JSON compacto y valores reales calculados (str.format). Solo
-// dispara en el cierre confirmado (buy/sell_signal ya lo garantizan) y con
-// alert.freq_once_per_bar_close.
+// alert() con JSON compacto por CONCATENACIÓN. NOTA: str.format() interpreta
+// las llaves {..} como placeholders (error "can't parse argument number" en
+// runtime), así que el JSON literal se arma concatenando strings.
 if buy_signal
-    alert(str.format('{"action":"BUY","symbol":"{0}","price":{1},"sl":{2},"tp1":{3},"tp2":{4},"tp3":{5}}', syminfo.ticker, str.tostring(entry_price, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp1_price, format.mintick), str.tostring(tp2_price, format.mintick), str.tostring(tp3_price, format.mintick)), alert.freq_once_per_bar_close)
+    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry_price, format.mintick) + ',"sl":' + str.tostring(sl_price, format.mintick) + ',"tp1":' + str.tostring(tp1_price, format.mintick) + ',"tp2":' + str.tostring(tp2_price, format.mintick) + ',"tp3":' + str.tostring(tp3_price, format.mintick) + '}', alert.freq_once_per_bar_close)
 if sell_signal
-    alert(str.format('{"action":"SELL","symbol":"{0}","price":{1},"sl":{2},"tp1":{3},"tp2":{4},"tp3":{5}}', syminfo.ticker, str.tostring(entry_price, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp1_price, format.mintick), str.tostring(tp2_price, format.mintick), str.tostring(tp3_price, format.mintick)), alert.freq_once_per_bar_close)
+    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry_price, format.mintick) + ',"sl":' + str.tostring(sl_price, format.mintick) + ',"tp1":' + str.tostring(tp1_price, format.mintick) + ',"tp2":' + str.tostring(tp2_price, format.mintick) + ',"tp3":' + str.tostring(tp3_price, format.mintick) + '}', alert.freq_once_per_bar_close)
 
 // ------------------------------------------ Tabla informativa (SL activo)
 var table info_tbl = table.new(position.top_right, 1, 2)
