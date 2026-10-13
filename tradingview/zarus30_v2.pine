@@ -1,142 +1,65 @@
 //@version=5
 // ============================================================================
-// ZARUS30 v2 - INDICADOR (clon corregido de la estrategia "ZARUS30" de YouTube)
-// ============================================================================
-// QUÉ HACE:
-//   - Nube ATR stepped que define la tendencia (misma lógica que v1):
-//     upper = high - mult*ATR, lower = low + mult*ATR, ratchet con max/min y
-//     flip cuando el close cruza la banda contraria.
-//   - En cada flip CONFIRMADO imprime señal BUY/SELL y proyecta los niveles del
-//     manual operativo: SL fijo por activo y TP1=1R, TP2=2R, TP3=3R (25 barras).
-//   - Emite alertas listas para webhook/bot (JSON compacto con niveles reales).
+// ZARUS30 Clone - Zonas OB & Vista Limpia (v2)
+// ----------------------------------------------------------------------------
+// Es el MISMO script del usuario, con 5 arreglos INVISIBLES para poder operar
+// de verdad con el (mismo aspecto, mismas senales, mismas zonas):
+//   1. SIN REPINTADO: el estado (trend_dir/trail_stop) y las zonas SOLO se
+//      actualizan al CIERRE de vela (barstate.isconfirmed). Con crossover
+//      intrabar la senal podia aparecer y desaparecer antes del cierre.
+//   2. ARRANQUE ROBUSTO: se exige direccion previa +/-1 antes de disparar
+//      (prev_dir), inmune a reinicializaciones del estado.
+//   3. ZONAS ROBUSTAS: guardas contra na (la version original podia crashear
+//      creando una caja con precio na en las primeras velas), saneo de zonas
+//      imposibles y left nunca negativo.
+//   4. SL POR ACTIVO: se mantienen US30=80 y Oro=12 y se anaden NAS100=20,
+//      GBPJPY=20 y BTCUSD=500 (antes el resto caia en SL de US30 por error).
+//   5. ALERTAS: alertcondition() + alert() JSON (action/symbol/price/sl/tp1/
+//      tp2/tp3) para conectar el bot por webhook. Sin efecto visual.
 //
-// CAMBIOS vs v1 (ZARUS30 Clone):
-//   1. FIX NO-REPAINT: el estado (trail_stop/trend_dir) SOLO se actualiza dentro
-//      de "if barstate.isconfirmed" (close confirmado). La señal se imprime una
-//      única vez, en la vela del flip, y NUNCA desaparece ni se mueve.
-//      Ver el bloque "FIX NO-REPAINT" más abajo para el detalle del enfoque.
-//   2. FIX PRIMERA BARRA: ya no dispara un BUY espurio cuando trend_dir pasa de
-//      0 a 1 al inicializarse: se exige estado previo ±1 (prev_dir) y ademas
-//      bar_index >= 2. v1 usaba ta.crossover(trend_dir, 0), que repintaba.
-//   3. SL POR ACTIVO: tabla completa US30 80 / NAS100 20 / XAUUSD 12 / GBPJPY 20
-//      / BTCUSD 500, detectada por ticker con str.contains y fallback a US30.
-//   4. SESIÓN/KILLZONE opcional (input.session, desactivada por defecto).
-//   5. ALERTAS: alertcondition() BUY/SELL con placeholders {{ticker}}/{{close}}
-//      + alert() con JSON compacto (concatenación, sin str.format: las llaves
-//      {..} se interpretan como placeholders y rompen el JSON) y
-//      alert.freq_once_per_bar_close.
-//   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), línea de
-//      ENTRADA punteada gris + niveles proyectados proj_bars velas (20 por
-//      defecto, como el script del usuario) con labels de precio.
-//   7. Archivo compañero: zarus30_v2_strategy.pine (la evidencia de backtest).
-//   8. GRÁFICO LIMPIO (Task 11-e): por defecto SOLO se muestra el último setup
-//      (los niveles SL/TP de señales anteriores se borran solos); el histórico
-//      de entradas queda como etiquetas pequeñas BUY/SELL. Toggles configurables.
-//   9. ZONAS DE INTERÉS SMC (Task 11-f): zonas OB estilo usuario — cuando el
-//      CIERRE rompe el último swing confirmado nace la zona de COMPRA (azul,
-//      sobre el último mínimo) o de VENTA (roja, bajo el último máximo); la
-//      zona activa se extiende hacia la derecha y se congela al ser mitigada
-//      (invasión total). FVG inmaculados y marcas BOS/CHoCH quedan como
-//      opciones extra (off por defecto). Detección solo con vela confirmada
-//      (mismo estándar no-repaint).
-//
-// CÓMO ACTIVAR LA ALERTA WEBHOOK (para el bot):
-//   1. Cargar este script en el gráfico del activo y TF deseados (M5/M15).
-//   2. Crear alerta -> Condición = "ZARUS30 v2 ..." (esta serie) -> opción
-//      "Cualquier llamada a la función alert()" (Any alert() function call).
-//   3. Activar "Webhook URL" y pegar la URL del bot; el JSON con action/symbol/
-//      price/sl/tp1/tp2/tp3 ya lo genera alert() con los valores reales.
-//   4. Alternativa simple: condición "ZARUS30 v2 BUY" / "ZARUS30 v2 SELL"
-//      (alertcondition con placeholders {{ticker}} y {{close}}, sin JSON).
-//
-// ADVERTENCIA: la señal se imprime AL CIERRE de la vela (vela confirmada). El
-// manual operativo manda operar en la apertura de la vela siguiente.
+// Cómo activar la alerta para el bot:
+//   Crear alerta -> Condicion = "Cualquier llamada a la funcion alert()"
+//   (Any alert() function call) -> Webhook URL del bot. Operar en la APERTURA
+//   de la vela siguiente al aviso (la senal se imprime al cierre).
 // ============================================================================
 
-indicator("ZARUS30 v2 - Niveles TP & SL (sin repintado)", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+indicator("ZARUS30 Clone - Zonas OB & Vista Limpia (v2)", overlay=true, max_labels_count=100, max_boxes_count=100, max_lines_count=100)
 
-// ------------------------------------------------------------- Entradas
-int   atr_len  = input.int(10, "Período ATR", minval=1)
-float atr_mult = input.float(3.0, "Multiplicador ATR", minval=0.1)
+// --- PARÁMETROS BASE ---
+atr_len      = input.int(10, "Período ATR", group="Canal de Tendencia")
+atr_mult     = input.float(3.0, "Multiplicador ATR", group="Canal de Tendencia")
+us30_sl_pts  = input.float(80.0, "Stop Loss US30 (Puntos)", group="Gestión de Riesgo")
+nas_sl_pts   = input.float(20.0, "Stop Loss NAS100 (Pips)", group="Gestión de Riesgo")
+gold_sl_pts  = input.float(12.0, "Stop Loss Oro (Puntos)", group="Gestión de Riesgo")
+gjp_sl_pts   = input.float(20.0, "Stop Loss GBPJPY (Pips)", group="Gestión de Riesgo")
+btc_sl_pts   = input.float(500.0, "Stop Loss BTCUSD (USD)", group="Gestión de Riesgo")
+proj_bars    = input.int(20, "Proyección Líneas (Velas)", group="Visualización")
+left_bars    = input.int(5, "Pivotes Izquierda OB", group="Zonas de Interés (SMC)")
+right_bars   = input.int(3, "Pivotes Derecha OB", group="Zonas de Interés (SMC)")
 
-// SL fijo por activo (manual operativo)
-float us30_sl_pts = input.float(80.0,  "SL US30 (puntos)")
-float nas_sl_pts  = input.float(20.0,  "SL NAS100 (pips)")
-float gold_sl_pts = input.float(12.0,  "SL XAUUSD (puntos)")
-float gjp_sl_pts  = input.float(20.0,  "SL GBPJPY (pips)")
-float btc_sl_pts  = input.float(500.0, "SL BTCUSD (USD)")
-
-// Sesión/killzone opcional (desactivada por defecto)
-bool   use_session = input.bool(false, "Filtrar por sesión/killzone")
-string session_str = input.session("0000-0000", "Sesión permitida (hora del exchange)")
-
-// Legibilidad del gráfico (Task 11-e)
-bool clean_chart = input.bool(true, "Solo el último setup (borra niveles de señales anteriores)")
-bool show_levels = input.bool(true, "Proyectar niveles SL/TP1/TP2/TP3")
-int  proj_bars   = input.int(20, "Proyección Líneas (Velas)", minval=5, maxval=100, group="Visualización")
-
-// Zonas de interés SMC (Task 11-f): OB por ruptura de estructura + FVG opcional
-bool  show_ob     = input.bool(true,  "Zonas OB (compra/venta)", group="Zonas de Interés (SMC)")
-int   ob_left     = input.int(5,      "Pivotes Izquierda OB", minval=1, group="Zonas de Interés (SMC)")
-int   ob_right    = input.int(3,      "Pivotes Derecha OB", minval=1, group="Zonas de Interés (SMC)")
-int   ob_max      = input.int(3,      "Máx. zonas activas por lado", minval=1, maxval=10, group="Zonas de Interés (SMC)")
-float ob_zone_atr = input.float(0.7,  "Altura de la zona (× ATR)", minval=0.1, step=0.1, group="Zonas de Interés (SMC)")
-bool  show_fvg    = input.bool(false, "Mostrar FVG (opcional)", group="Zonas de Interés (SMC)")
-int   max_fvg     = input.int(3,      "Máx. FVG activos por lado", minval=1, maxval=10, group="Zonas de Interés (SMC)")
-int   fvg_max_age = input.int(150,    "Expiración FVG (barras)", minval=20, group="Zonas de Interés (SMC)")
-float fvg_min_atr = input.float(0.1,  "Tamaño mín. FVG (× ATR)", minval=0.0, step=0.05, group="Zonas de Interés (SMC)")
-bool  show_bos    = input.bool(false, "Marcas BOS / CHoCH", group="Zonas de Interés (SMC)")
-
-// --------------------------------------------- SL fijo según ticker (v2)
-// Detección del activo por ticker en un único bloque if/else if, ordenado de
-// más específico a más genérico. Fallback: US30.
-float  sl_points = us30_sl_pts
-string sl_asset  = "US30 (fallback)"
+// --- SL POR ACTIVO (arreglo 4: antes solo US30 y Oro) ---
+sl_points = us30_sl_pts
 if str.contains(syminfo.ticker, "BTC")
     sl_points := btc_sl_pts
-    sl_asset  := "BTCUSD"
 else if str.contains(syminfo.ticker, "NAS") or str.contains(syminfo.ticker, "USTEC")
     sl_points := nas_sl_pts
-    sl_asset  := "NAS100"
 else if str.contains(syminfo.ticker, "GBPJPY") or (str.contains(syminfo.ticker, "GBP") and str.contains(syminfo.ticker, "JPY"))
     sl_points := gjp_sl_pts
-    sl_asset  := "GBPJPY"
 else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
     sl_points := gold_sl_pts
-    sl_asset  := "XAUUSD"
 
-// ------------------------------------------------ Sesión opcional (v2)
-// Patrón estándar: not na(time(...)) es true cuando la vela pertenece a la sesión.
-bool session_ok = not use_session or not na(time(timeframe.period, session_str))
-
-// ------------------------------------------- Nube ATR (idéntica a v1)
-float atr_val    = ta.atr(atr_len)
-float upper_band = high - (atr_mult * atr_val)
-float lower_band = low + (atr_mult * atr_val)
+// --- CÁLCULO ATR STEPPED (arreglo 1: estado SOLO al cierre de vela) ---
+atr_val    = ta.atr(atr_len)
+upper_band = high - (atr_mult * atr_val)
+lower_band = low + (atr_mult * atr_val)
 
 var float trail_stop = na
-var int   trend_dir  = 0
+var int   trend_dir  = 0 // 1: Alcista, -1: Bajista
 var int   prev_dir   = 0
 
-// ============================================================================
-// FIX NO-REPAINT (enfoque elegido: opción recomendada #1 de la especificación)
-// ----------------------------------------------------------------------------
-// TODO el estado solo se muta dentro de "if barstate.isconfirmed", es decir con
-// el close CONFIRMADO de la vela. Al inicio de cada ejecución confirmada se
-// guarda prev_dir = trend_dir (valor vigente = cierre de la vela anterior,
-// porque durante la vela viva el estado queda congelado). El flip se decide en
-// ESA vela cerrada y ahí, y solo ahí, se emite la señal.
-//   - En histórico: barstate.isconfirmed es true en todas las barras -> cálculo
-//     idéntico a v1.
-//   - En tiempo real: durante la vela viva nada cambia (sin parpadeos ni flips
-//     fantasma); en el tick de cierre se decide y se dibuja -> una vez impresa
-//     la señal no desaparece ni se mueve NUNCA.
-// Alternativa descartada (trend_dir[1] vs trend_dir, alertando en la apertura
-// de la vela siguiente): añade un retraso extra de una vela y mezcla dos velas
-// en la decisión; el enfoque elegido cumple "operar SOLO al cierre de vela".
-// ============================================================================
-bool flip_up = false
-bool flip_dn = false
+bool buy_trigger  = false
+bool sell_trigger = false
+
 if barstate.isconfirmed
     prev_dir := trend_dir
     if na(trail_stop)
@@ -154,213 +77,135 @@ if barstate.isconfirmed
             trail_stop := upper_band
         else
             trail_stop := math.min(trail_stop, lower_band)
-    // Flip decidido en ESTA vela confirmada (prev_dir ±1 excluye el salto 0 -> 1)
-    flip_up := trend_dir == 1 and prev_dir == -1
-    flip_dn := trend_dir == -1 and prev_dir == 1
+    // Flip confirmado (arreglo 2: prev_dir +/-1 excluye disparos de arranque)
+    buy_trigger  := trend_dir == 1 and prev_dir == -1
+    sell_trigger := trend_dir == -1 and prev_dir == 1
 
-// Señales válidas: flip confirmado + sesión permitida + fuera de las 2 primeras barras
-bool buy_signal  = flip_up and session_ok and bar_index >= 2
-bool sell_signal = flip_dn and session_ok and bar_index >= 2
+// Nube dinámica
+p_price = plot(hl2, display=display.none)
+p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
+fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 88) : color.new(color.red, 88))
 
-// ------------------------------------ Niveles del manual (entry ± 1R/2R/3R)
-float entry_price = na
-float sl_price    = na
-float tp1_price   = na
-float tp2_price   = na
-float tp3_price   = na
-if buy_signal
-    entry_price := close
-    sl_price    := close - sl_points
-    tp1_price   := close + sl_points
-    tp2_price   := close + 2.0 * sl_points
-    tp3_price   := close + 3.0 * sl_points
-if sell_signal
-    entry_price := close
-    sl_price    := close + sl_points
-    tp1_price   := close - sl_points
-    tp2_price   := close - 2.0 * sl_points
-    tp3_price   := close - 3.0 * sl_points
+// --- GESTIÓN DE LÍNEAS DE TRADE ACTIVO (SIN ACUMULACIÓN) ---
+var line l_entry = na
+var line l_sl    = na
+var line l_tp1   = na
+var line l_tp2   = na
+var line l_tp3   = na
 
-// ============================================================================
-// ZONAS DE INTERÉS SMC (Task 11-f): Order Blocks por ruptura de estructura
-// (estilo pedido por el usuario) + FVG opcional + BOS/CHoCH opcional.
-// Detección y mutación de estado SOLO en barstate.isconfirmed (no-repaint).
-//
-//   - Swing: último pivote confirmado (pivothigh/pivotlow izq/der).
-//   - Ruptura alcista: el CIERRE cruza por encima del último swing high ->
-//     nace "ZONA DE COMPRA (OB)" sobre el último swing low:
-//     top = swing low, bottom = swing low - altura*ATR (caja azul).
-//   - Ruptura bajista: el CIERRE cruza por debajo del último swing low ->
-//     nace "ZONA DE VENTA (OB)" bajo el último swing high:
-//     top = swing high + altura*ATR, bottom = swing high (caja roja).
-//   - La zona activa se extiende hacia la derecha; cuando el precio la invade
-//     por COMPLETO (low < bottom / high > top) se congela en la vela de
-//     mitigación (queda como histórico POI) y deja de gestionarse.
-//   - Tope de zonas activas por lado (se elimina la más antigua).
-// ============================================================================
-float ph = ta.pivothigh(ob_left, ob_right)
-float pl = ta.pivotlow(ob_left, ob_right)
-var float swing_hi   = na
-var float swing_lo   = na
-var int   struct_dir = 1
+var label lb_sl  = na
+var label lb_tp1 = na
+var label lb_tp2 = na
+var label lb_tp3 = na
 
-type OBZone
+f_limpiar_lineas() =>
+    line.delete(l_entry)
+    line.delete(l_sl)
+    line.delete(l_tp1)
+    line.delete(l_tp2)
+    line.delete(l_tp3)
+    label.delete(lb_sl)
+    label.delete(lb_tp1)
+    label.delete(lb_tp2)
+    label.delete(lb_tp3)
+
+if buy_trigger
+    f_limpiar_lineas()
+    entry = close
+    sl    = entry - sl_points
+    tp1   = entry + (sl_points * 1.0)
+    tp2   = entry + (sl_points * 2.0)
+    tp3   = entry + (sl_points * 3.0)
+
+    label.new(bar_index, low - (atr_val * 0.4), "BUY", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    l_entry := line.new(bar_index, entry, bar_index + proj_bars, entry, color=color.gray, width=1, style=line.style_dotted)
+    l_sl    := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
+    l_tp1   := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.teal, width=1)
+    l_tp2   := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.teal, width=2)
+    l_tp3   := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.teal, width=1)
+
+    lb_sl   := label.new(bar_index + proj_bars, sl, "SL: " + str.tostring(sl, "#"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp1  := label.new(bar_index + proj_bars, tp1, "TP1", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp2  := label.new(bar_index + proj_bars, tp2, "TP2", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp3  := label.new(bar_index + proj_bars, tp3, "TP3", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    // Alerta JSON para el bot (arreglo 5, sin efecto visual)
+    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + '}', alert.freq_once_per_bar_close)
+
+if sell_trigger
+    f_limpiar_lineas()
+    entry = close
+    sl    = entry + sl_points
+    tp1   = entry - (sl_points * 1.0)
+    tp2   = entry - (sl_points * 2.0)
+    tp3   = entry - (sl_points * 3.0)
+
+    label.new(bar_index, high + (atr_val * 0.4), "SELL", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    l_entry := line.new(bar_index, entry, bar_index + proj_bars, entry, color=color.gray, width=1, style=line.style_dotted)
+    l_sl    := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
+    l_tp1   := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.teal, width=1)
+    l_tp2   := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.teal, width=2)
+    l_tp3   := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.teal, width=1)
+
+    lb_sl   := label.new(bar_index + proj_bars, sl, "SL: " + str.tostring(sl, "#"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp1  := label.new(bar_index + proj_bars, tp1, "TP1", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp2  := label.new(bar_index + proj_bars, tp2, "TP2", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    lb_tp3  := label.new(bar_index + proj_bars, tp3, "TP3", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    // Alerta JSON para el bot (arreglo 5, sin efecto visual)
+    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + '}', alert.freq_once_per_bar_close)
+
+// --- ZONAS DE INTERÉS (ORDER BLOCKS) CON MITIGACIÓN ---
+p_high = ta.pivothigh(high, left_bars, right_bars)
+p_low  = ta.pivotlow(low, left_bars, right_bars)
+
+var float last_ph = na
+var float last_pl = na
+
+type OB
     box   b
     float top
     float btm
+    bool  bull
 
-var array<OBZone> obs_bull = array.new<OBZone>()
-var array<OBZone> obs_bear = array.new<OBZone>()
+var OB[] obs = array.new<OB>()
 
-var array<box>   fvg_bull     = array.new<box>()
-var array<box>   fvg_bear     = array.new<box>()
-var array<float> fvg_bull_bot = array.new<float>()
-var array<float> fvg_bear_top = array.new<float>()
-var array<int>   fvg_bull_bar = array.new<int>()
-var array<int>   fvg_bear_bar = array.new<int>()
-
+// Creación de Zona al haber quiebre de estructura (arreglo 1 y 3: SOLO vela
+// confirmada, pivotes/ATR existentes, zona en el lado correcto del precio y
+// left nunca negativo en las primeras velas).
 if barstate.isconfirmed
-    // ── Swing: pivotes confirmados
-    if not na(ph)
-        swing_hi := ph
-    if not na(pl)
-        swing_lo := pl
-    // ── Ruptura de estructura: el CIERRE cruza el swing vigente (solo el
-    //    cruce inicial; sin re-disparos mientras el cierre siga del mismo lado)
-    bool broke_hi = not na(swing_hi) and close > swing_hi and close[1] <= swing_hi
-    bool broke_lo = not na(swing_lo) and close < swing_lo and close[1] >= swing_lo
-    // ── Marcas BOS / CHoCH (opcional, off por defecto)
-    if show_bos and broke_hi
-        label.new(bar_index, high, struct_dir == -1 ? "CHoCH" : "BOS", style=label.style_label_down, color=color.new(struct_dir == -1 ? color.orange : color.teal, 20), textcolor=color.white, size=size.tiny)
-        struct_dir := 1
-    if show_bos and broke_lo
-        label.new(bar_index, low, struct_dir == 1 ? "CHoCH" : "BOS", style=label.style_label_up, color=color.new(struct_dir == 1 ? color.orange : color.red, 20), textcolor=color.white, size=size.tiny)
-        struct_dir := -1
-    // ── Zonas OB: la ruptura deja la zona en el pivote opuesto (estilo usuario)
-    if show_ob and broke_hi and not na(swing_lo) and not na(atr_val) and swing_lo < close
-        float z_top = swing_lo
-        float z_btm = swing_lo - ob_zone_atr * atr_val
-        array.push(obs_bull, OBZone.new(box.new(math.max(0, bar_index - ob_right - 5), z_top, bar_index + 15, z_btm, bgcolor=color.new(color.blue, 85), border_color=color.blue, border_width=1, text="ZONA DE COMPRA (OB)", text_size=size.tiny, text_color=color.new(color.blue, 15)), z_top, z_btm))
-        swing_hi := na
-        if array.size(obs_bull) > ob_max
-            OBZone old_b = array.shift(obs_bull)
-            box.delete(old_b.b)
-    if show_ob and broke_lo and not na(swing_hi) and not na(atr_val) and swing_hi > close
-        float z_top = swing_hi + ob_zone_atr * atr_val
-        float z_btm = swing_hi
-        array.push(obs_bear, OBZone.new(box.new(math.max(0, bar_index - ob_right - 5), z_top, bar_index + 15, z_btm, bgcolor=color.new(color.red, 85), border_color=color.red, border_width=1, text="ZONA DE VENTA (OB)", text_size=size.tiny, text_color=color.new(color.red, 15)), z_top, z_btm))
-        swing_lo := na
-        if array.size(obs_bear) > ob_max
-            OBZone old_s = array.shift(obs_bear)
-            box.delete(old_s.b)
-    // ── Gestión de zonas OB activas: extensión + mitigación (invasión total)
-    if array.size(obs_bull) > 0
-        for i = array.size(obs_bull) - 1 to 0
-            OBZone zb = array.get(obs_bull, i)
-            box.set_right(zb.b, bar_index + 10)
-            if low < zb.btm
-                box.set_right(zb.b, bar_index)
-                array.remove(obs_bull, i)
-    if array.size(obs_bear) > 0
-        for i = array.size(obs_bear) - 1 to 0
-            OBZone zs = array.get(obs_bear, i)
-            box.set_right(zs.b, bar_index + 10)
-            if high > zs.top
-                box.set_right(zs.b, bar_index)
-                array.remove(obs_bear, i)
-    // ── Mitigación / expiración de FVG (opcional; recorrido inverso para remove)
-    if array.size(fvg_bull) > 0
-        for i = array.size(fvg_bull) - 1 to 0
-            if close < array.get(fvg_bull_bot, i) or bar_index - array.get(fvg_bull_bar, i) > fvg_max_age
-                box.delete(array.get(fvg_bull, i))
-                array.remove(fvg_bull, i)
-                array.remove(fvg_bull_bot, i)
-                array.remove(fvg_bull_bar, i)
-    if array.size(fvg_bear) > 0
-        for i = array.size(fvg_bear) - 1 to 0
-            if close > array.get(fvg_bear_top, i) or bar_index - array.get(fvg_bear_bar, i) > fvg_max_age
-                box.delete(array.get(fvg_bear, i))
-                array.remove(fvg_bear, i)
-                array.remove(fvg_bear_top, i)
-                array.remove(fvg_bear_bar, i)
-    // ── Nuevos FVG (hueco de 3 velas con tamaño mínimo configurable)
-    if show_fvg and low > high[2] and (low - high[2]) >= fvg_min_atr * atr_val
-        array.push(fvg_bull, box.new(bar_index - 1, low, bar_index + 5, high[2], border_color=color.new(color.teal, 55), border_width=1, bgcolor=color.new(color.teal, 82), extend=extend.right))
-        array.push(fvg_bull_bot, high[2])
-        array.push(fvg_bull_bar, bar_index)
-        if array.size(fvg_bull) > max_fvg
-            box.delete(array.shift(fvg_bull))
-            array.shift(fvg_bull_bot)
-            array.shift(fvg_bull_bar)
-    if show_fvg and high < low[2] and (low[2] - high) >= fvg_min_atr * atr_val
-        array.push(fvg_bear, box.new(bar_index - 1, low[2], bar_index + 5, high, border_color=color.new(color.red, 55), border_width=1, bgcolor=color.new(color.red, 84), extend=extend.right))
-        array.push(fvg_bear_top, low[2])
-        array.push(fvg_bear_bar, bar_index)
-        if array.size(fvg_bear) > max_fvg
-            box.delete(array.shift(fvg_bear))
-            array.shift(fvg_bear_top)
-            array.shift(fvg_bear_bar)
+    if not na(p_high)
+        last_ph := p_high
+    if not na(p_low)
+        last_pl := p_low
 
-// ----------------------------------------------------------------- Dibujo
-p_price = plot(hl2, display=display.none)
-p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
-fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 85) : color.new(color.red, 85))
+    bool bos_up = not na(last_ph) and not na(last_pl) and not na(atr_val) and close > last_ph and close[1] <= last_ph and last_pl < close
+    bool bos_dn = not na(last_ph) and not na(last_pl) and not na(atr_val) and close < last_pl and close[1] >= last_pl and last_ph > close
 
-// Task 11-e: registro de los niveles dibujados para poder limpiarlos.
-// Las etiquetas BUY/SELL NO se registran: el histórico de entradas queda.
-var array<line>  lvl_lines  = array.new<line>()
-var array<label> lvl_labels = array.new<label>()
-if (buy_signal or sell_signal) and clean_chart
-    while array.size(lvl_lines) > 0
-        line.delete(array.pop(lvl_lines))
-    while array.size(lvl_labels) > 0
-        label.delete(array.pop(lvl_labels))
+    if bos_up
+        box_buy = box.new(math.max(0, bar_index - right_bars - 5), last_pl, bar_index + 15, last_pl - (atr_val * 0.7), bgcolor=color.new(color.blue, 85), border_color=color.blue, text="ZONA DE COMPRA (OB)", text_size=size.tiny, text_color=color.blue)
+        array.push(obs, OB.new(box_buy, last_pl, last_pl - (atr_val * 0.7), true))
+        last_ph := na
 
-// Señal + niveles proyectados proj_bars velas (entrada punteada + SL/TP1/TP2/TP3).
-// Solo se ejecutan UNA vez (vela confirmada del flip) -> sin repintado.
-if buy_signal
-    label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
-    if show_levels
-        int x2 = bar_index + proj_bars
-        array.push(lvl_lines, line.new(bar_index, entry_price, x2, entry_price, color=color.gray, width=1, style=line.style_dotted))
-        array.push(lvl_lines, line.new(bar_index, sl_price, x2, sl_price, color=color.new(color.red, 0), width=2))
-        array.push(lvl_lines, line.new(bar_index, tp1_price, x2, tp1_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_lines, line.new(bar_index, tp2_price, x2, tp2_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_lines, line.new(bar_index, tp3_price, x2, tp3_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_labels, label.new(x2, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.new(color.red, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
-if sell_signal
-    label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
-    if show_levels
-        int x2s = bar_index + proj_bars
-        array.push(lvl_lines, line.new(bar_index, entry_price, x2s, entry_price, color=color.gray, width=1, style=line.style_dotted))
-        array.push(lvl_lines, line.new(bar_index, sl_price, x2s, sl_price, color=color.new(color.red, 0), width=2))
-        array.push(lvl_lines, line.new(bar_index, tp1_price, x2s, tp1_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_lines, line.new(bar_index, tp2_price, x2s, tp2_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_lines, line.new(bar_index, tp3_price, x2s, tp3_price, color=color.new(color.teal, 25), width=1))
-        array.push(lvl_labels, label.new(x2s, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.new(color.red, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2s, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2s, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
-        array.push(lvl_labels, label.new(x2s, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
+    if bos_dn
+        box_sell = box.new(math.max(0, bar_index - right_bars - 5), last_ph + (atr_val * 0.7), bar_index + 15, last_ph, bgcolor=color.new(color.red, 85), border_color=color.red, text="ZONA DE VENTA (OB)", text_size=size.tiny, text_color=color.red)
+        array.push(obs, OB.new(box_sell, last_ph + (atr_val * 0.7), last_ph, false))
+        last_pl := na
 
-// ---------------------------------------------------------------- Alertas
-// alertcondition: placeholders {{ticker}} y {{close}} los resuelve TradingView.
-// Mensajes en ASCII para máxima compatibilidad con consumidores de webhook.
-alertcondition(buy_signal, "ZARUS30 v2 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
-alertcondition(sell_signal, "ZARUS30 v2 SELL", "ZARUS30 SELL {{ticker}} @ {{close}} (senal al cierre de vela)")
+    // Mitigación y extensión de Zonas activas
+    if array.size(obs) > 0
+        for i = array.size(obs) - 1 to 0
+            o = array.get(obs, i)
+            // Si el precio mitiga la zona, se corta la proyección
+            mitigated = (o.bull and low < o.btm) or (not o.bull and high > o.top)
+            if mitigated
+                box.set_right(o.b, bar_index)
+                array.remove(obs, i)
+            else
+                box.set_right(o.b, bar_index + 10)
 
-// alert() con JSON compacto por CONCATENACIÓN. NOTA: str.format() interpreta
-// las llaves {..} como placeholders (error "can't parse argument number" en
-// runtime), así que el JSON literal se arma concatenando strings.
-if buy_signal
-    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry_price, format.mintick) + ',"sl":' + str.tostring(sl_price, format.mintick) + ',"tp1":' + str.tostring(tp1_price, format.mintick) + ',"tp2":' + str.tostring(tp2_price, format.mintick) + ',"tp3":' + str.tostring(tp3_price, format.mintick) + '}', alert.freq_once_per_bar_close)
-if sell_signal
-    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry_price, format.mintick) + ',"sl":' + str.tostring(sl_price, format.mintick) + ',"tp1":' + str.tostring(tp1_price, format.mintick) + ',"tp2":' + str.tostring(tp2_price, format.mintick) + ',"tp3":' + str.tostring(tp3_price, format.mintick) + '}', alert.freq_once_per_bar_close)
-
-// ------------------------------------------ Tabla informativa (SL activo)
-var table info_tbl = table.new(position.top_right, 1, 2)
-if barstate.islast
-    table.cell(info_tbl, 0, 0, "ZARUS30 v2 | " + sl_asset, text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=size.small)
-    table.cell(info_tbl, 0, 1, "SL fijo: " + str.tostring(sl_points, format.mintick), text_color=color.white, bgcolor=color.new(color.gray, 25), text_size=size.small)
+// --- ALERTAS SIMPLES (alternativa sin JSON: condición por señal) ---
+alertcondition(buy_trigger, "ZARUS30 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
+alertcondition(sell_trigger, "ZARUS30 SELL", "ZARUS30 SELL {{ticker}} @ {{close}} (senal al cierre de vela)")
