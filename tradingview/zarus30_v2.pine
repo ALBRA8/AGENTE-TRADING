@@ -1,0 +1,202 @@
+//@version=5
+// ============================================================================
+// ZARUS30 v2 - INDICADOR (clon corregido de la estrategia "ZARUS30" de YouTube)
+// ============================================================================
+// QUÉ HACE:
+//   - Nube ATR stepped que define la tendencia (misma lógica que v1):
+//     upper = high - mult*ATR, lower = low + mult*ATR, ratchet con max/min y
+//     flip cuando el close cruza la banda contraria.
+//   - En cada flip CONFIRMADO imprime señal BUY/SELL y proyecta los niveles del
+//     manual operativo: SL fijo por activo y TP1=1R, TP2=2R, TP3=3R (25 barras).
+//   - Emite alertas listas para webhook/bot (JSON compacto con niveles reales).
+//
+// CAMBIOS vs v1 (ZARUS30 Clone):
+//   1. FIX NO-REPAINT: el estado (trail_stop/trend_dir) SOLO se actualiza dentro
+//      de "if barstate.isconfirmed" (close confirmado). La señal se imprime una
+//      única vez, en la vela del flip, y NUNCA desaparece ni se mueve.
+//      Ver el bloque "FIX NO-REPAINT" más abajo para el detalle del enfoque.
+//   2. FIX PRIMERA BARRA: ya no dispara un BUY espurio cuando trend_dir pasa de
+//      0 a 1 al inicializarse: se exige estado previo ±1 (prev_dir) y ademas
+//      bar_index >= 2. v1 usaba ta.crossover(trend_dir, 0), que repintaba.
+//   3. SL POR ACTIVO: tabla completa US30 80 / NAS100 20 / XAUUSD 12 / GBPJPY 20
+//      / BTCUSD 500, detectada por ticker con str.contains y fallback a US30.
+//   4. SESIÓN/KILLZONE opcional (input.session, desactivada por defecto).
+//   5. ALERTAS: alertcondition() BUY/SELL con placeholders {{ticker}}/{{close}}
+//      + alert() con JSON compacto (str.format) y alert.freq_once_per_bar_close.
+//   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), líneas
+//      proyectadas 25 barras con labels de precio (SL, TP1, TP2, TP3).
+//   7. Archivo compañero: zarus30_v2_strategy.pine (la evidencia de backtest).
+//
+// CÓMO ACTIVAR LA ALERTA WEBHOOK (para el bot):
+//   1. Cargar este script en el gráfico del activo y TF deseados (M5/M15).
+//   2. Crear alerta -> Condición = "ZARUS30 v2 ..." (esta serie) -> opción
+//      "Cualquier llamada a la función alert()" (Any alert() function call).
+//   3. Activar "Webhook URL" y pegar la URL del bot; el JSON con action/symbol/
+//      price/sl/tp1/tp2/tp3 ya lo genera alert() con los valores reales.
+//   4. Alternativa simple: condición "ZARUS30 v2 BUY" / "ZARUS30 v2 SELL"
+//      (alertcondition con placeholders {{ticker}} y {{close}}, sin JSON).
+//
+// ADVERTENCIA: la señal se imprime AL CIERRE de la vela (vela confirmada). El
+// manual operativo manda operar en la apertura de la vela siguiente.
+// ============================================================================
+
+indicator("ZARUS30 v2 - Niveles TP & SL (sin repintado)", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+// ------------------------------------------------------------- Entradas
+int   atr_len  = input.int(10, "Período ATR", minval=1)
+float atr_mult = input.float(3.0, "Multiplicador ATR", minval=0.1)
+
+// SL fijo por activo (manual operativo)
+float us30_sl_pts = input.float(80.0,  "SL US30 (puntos)")
+float nas_sl_pts  = input.float(20.0,  "SL NAS100 (pips)")
+float gold_sl_pts = input.float(12.0,  "SL XAUUSD (puntos)")
+float gjp_sl_pts  = input.float(20.0,  "SL GBPJPY (pips)")
+float btc_sl_pts  = input.float(500.0, "SL BTCUSD (USD)")
+
+// Sesión/killzone opcional (desactivada por defecto)
+bool   use_session = input.bool(false, "Filtrar por sesión/killzone")
+string session_str = input.session("0000-0000", "Sesión permitida (hora del exchange)")
+
+// --------------------------------------------- SL fijo según ticker (v2)
+// Detección del activo por ticker en un único bloque if/else if, ordenado de
+// más específico a más genérico. Fallback: US30.
+float  sl_points = us30_sl_pts
+string sl_asset  = "US30 (fallback)"
+if str.contains(syminfo.ticker, "BTC")
+    sl_points := btc_sl_pts
+    sl_asset  := "BTCUSD"
+else if str.contains(syminfo.ticker, "NAS") or str.contains(syminfo.ticker, "USTEC")
+    sl_points := nas_sl_pts
+    sl_asset  := "NAS100"
+else if str.contains(syminfo.ticker, "GBPJPY") or (str.contains(syminfo.ticker, "GBP") and str.contains(syminfo.ticker, "JPY"))
+    sl_points := gjp_sl_pts
+    sl_asset  := "GBPJPY"
+else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+    sl_points := gold_sl_pts
+    sl_asset  := "XAUUSD"
+
+// ------------------------------------------------ Sesión opcional (v2)
+// Patrón estándar: not na(time(...)) es true cuando la vela pertenece a la sesión.
+bool session_ok = not use_session or not na(time(timeframe.period, session_str))
+
+// ------------------------------------------- Nube ATR (idéntica a v1)
+float atr_val    = ta.atr(atr_len)
+float upper_band = high - (atr_mult * atr_val)
+float lower_band = low + (atr_mult * atr_val)
+
+var float trail_stop = na
+var int   trend_dir  = 0
+var int   prev_dir   = 0
+
+// ============================================================================
+// FIX NO-REPAINT (enfoque elegido: opción recomendada #1 de la especificación)
+// ----------------------------------------------------------------------------
+// TODO el estado solo se muta dentro de "if barstate.isconfirmed", es decir con
+// el close CONFIRMADO de la vela. Al inicio de cada ejecución confirmada se
+// guarda prev_dir = trend_dir (valor vigente = cierre de la vela anterior,
+// porque durante la vela viva el estado queda congelado). El flip se decide en
+// ESA vela cerrada y ahí, y solo ahí, se emite la señal.
+//   - En histórico: barstate.isconfirmed es true en todas las barras -> cálculo
+//     idéntico a v1.
+//   - En tiempo real: durante la vela viva nada cambia (sin parpadeos ni flips
+//     fantasma); en el tick de cierre se decide y se dibuja -> una vez impresa
+//     la señal no desaparece ni se mueve NUNCA.
+// Alternativa descartada (trend_dir[1] vs trend_dir, alertando en la apertura
+// de la vela siguiente): añade un retraso extra de una vela y mezcla dos velas
+// en la decisión; el enfoque elegido cumple "operar SOLO al cierre de vela".
+// ============================================================================
+bool flip_up = false
+bool flip_dn = false
+if barstate.isconfirmed
+    prev_dir := trend_dir
+    if na(trail_stop)
+        trail_stop := close
+        trend_dir  := 1
+    if trend_dir == 1
+        if close < trail_stop
+            trend_dir  := -1
+            trail_stop := lower_band
+        else
+            trail_stop := math.max(trail_stop, upper_band)
+    else
+        if close > trail_stop
+            trend_dir  := 1
+            trail_stop := upper_band
+        else
+            trail_stop := math.min(trail_stop, lower_band)
+    // Flip decidido en ESTA vela confirmada (prev_dir ±1 excluye el salto 0 -> 1)
+    flip_up := trend_dir == 1 and prev_dir == -1
+    flip_dn := trend_dir == -1 and prev_dir == 1
+
+// Señales válidas: flip confirmado + sesión permitida + fuera de las 2 primeras barras
+bool buy_signal  = flip_up and session_ok and bar_index >= 2
+bool sell_signal = flip_dn and session_ok and bar_index >= 2
+
+// ------------------------------------ Niveles del manual (entry ± 1R/2R/3R)
+float entry_price = na
+float sl_price    = na
+float tp1_price   = na
+float tp2_price   = na
+float tp3_price   = na
+if buy_signal
+    entry_price := close
+    sl_price    := close - sl_points
+    tp1_price   := close + sl_points
+    tp2_price   := close + 2.0 * sl_points
+    tp3_price   := close + 3.0 * sl_points
+if sell_signal
+    entry_price := close
+    sl_price    := close + sl_points
+    tp1_price   := close - sl_points
+    tp2_price   := close - 2.0 * sl_points
+    tp3_price   := close - 3.0 * sl_points
+
+// ----------------------------------------------------------------- Dibujo
+p_price = plot(hl2, display=display.none)
+p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
+fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 85) : color.new(color.red, 85))
+
+// Señal + líneas proyectadas 25 barras (SL/TP1/TP2/TP3) con labels de precio.
+// Solo se ejecutan UNA vez (vela confirmada del flip) -> sin repintado.
+if buy_signal
+    label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    int x2 = bar_index + 25
+    line.new(bar_index, sl_price, x2, sl_price, color=color.red, width=2)
+    line.new(bar_index, tp1_price, x2, tp1_price, color=color.green, width=1)
+    line.new(bar_index, tp2_price, x2, tp2_price, color=color.green, width=1)
+    line.new(bar_index, tp3_price, x2, tp3_price, color=color.green, width=1)
+    label.new(x2, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+    label.new(x2, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(x2, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(x2, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+if sell_signal
+    label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    int x2s = bar_index + 25
+    line.new(bar_index, sl_price, x2s, sl_price, color=color.red, width=2)
+    line.new(bar_index, tp1_price, x2s, tp1_price, color=color.green, width=1)
+    line.new(bar_index, tp2_price, x2s, tp2_price, color=color.green, width=1)
+    line.new(bar_index, tp3_price, x2s, tp3_price, color=color.green, width=1)
+    label.new(x2s, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+    label.new(x2s, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(x2s, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(x2s, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+
+// ---------------------------------------------------------------- Alertas
+// alertcondition: placeholders {{ticker}} y {{close}} los resuelve TradingView.
+// Mensajes en ASCII para máxima compatibilidad con consumidores de webhook.
+alertcondition(buy_signal, "ZARUS30 v2 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
+alertcondition(sell_signal, "ZARUS30 v2 SELL", "ZARUS30 SELL {{ticker}} @ {{close}} (senal al cierre de vela)")
+
+// alert() con JSON compacto y valores reales calculados (str.format). Solo
+// dispara en el cierre confirmado (buy/sell_signal ya lo garantizan) y con
+// alert.freq_once_per_bar_close.
+if buy_signal
+    alert(str.format('{"action":"BUY","symbol":"{0}","price":{1},"sl":{2},"tp1":{3},"tp2":{4},"tp3":{5}}', syminfo.ticker, str.tostring(entry_price, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp1_price, format.mintick), str.tostring(tp2_price, format.mintick), str.tostring(tp3_price, format.mintick)), alert.freq_once_per_bar_close)
+if sell_signal
+    alert(str.format('{"action":"SELL","symbol":"{0}","price":{1},"sl":{2},"tp1":{3},"tp2":{4},"tp3":{5}}', syminfo.ticker, str.tostring(entry_price, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp1_price, format.mintick), str.tostring(tp2_price, format.mintick), str.tostring(tp3_price, format.mintick)), alert.freq_once_per_bar_close)
+
+// ------------------------------------------ Tabla informativa (SL activo)
+var table info_tbl = table.new(position.top_right, 1, 2)
+if barstate.islast
+    table.cell(info_tbl, 0, 0, "ZARUS30 v2 | " + sl_asset, text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=size.small)
+    table.cell(info_tbl, 0, 1, "SL fijo: " + str.tostring(sl_points, format.mintick), text_color=color.white, bgcolor=color.new(color.gray, 25), text_size=size.small)

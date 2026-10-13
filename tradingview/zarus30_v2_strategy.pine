@@ -1,0 +1,266 @@
+//@version=5
+// ============================================================================
+// ZARUS30 v2 STRATEGY - VALIDACIÓN / BACKTEST (la evidencia que faltaba en v1)
+// ============================================================================
+// QUÉ ES: la MISMA lógica de nube/flip confirmado del indicador zarus30_v2.pine
+// convertida en strategy() para medir si la señal vale algo con fricciones
+// (comisión + slippage). Sin backtest no hay estrategia, solo un dibujo.
+//
+// CÓMO CORRERLO:
+//   1. Gráfico del activo + TF (sugerido: M5 y M15) -> añadir el script ->
+//      pestaña "Strategy Tester" (Probador de estrategias).
+//   2. Propiedades del script: capital inicial 10000, comisión 0.005% por
+//      operación y slippage 2 ticks. NOTA IMPORTANTE: Pine exige CONSTANTES en
+//      la declaración strategy(), por eso commission_value y slippage NO son
+//      input.float/input.int (no compilaría); se ajustan con el mismo efecto
+//      desde el diálogo "Propiedades" del script en TradingView.
+//   3. Repetir por activo: US30, NAS100, XAUUSD, GBPJPY, BTCUSD.
+//
+// MÉTRICAS A REGISTRAR (por activo y TF, con comisiones y slippage activos):
+//   - Net Profit (abs y %), Profit Factor, Win Rate, Max Drawdown, nº de trades
+//     y ratio medio ganadora/perdedora. Copiarlas al worklog de AGENTE-TRADING.
+//
+// CRITERIOS DE ACEPTACIÓN SUGERIDOS (para el Módulo 1 como fuente de señal):
+//   - PF > 1.3 y MaxDD < 20% en US30 M5 CON comisiones y slippage.
+//   - Si NO se cumple -> ZARUS30 queda DESCARTADO como fuente de señal autónoma
+//     y solo se conserva como overlay visual de tendencia (indicador v2).
+//
+// GESTIÓN SEGÚN EL MANUAL OPERATIVO:
+//   - Entrada al cierre de la vela de señal (process_orders_on_close=true).
+//   - SL fijo por activo: US30 80 pts, NAS100 20, XAUUSD 12, GBPJPY 20,
+//     BTCUSD 500 USD (fallback US30). TP1/TP2/TP3 = 1R/2R/3R.
+//   - Modo por defecto "3 TPs parciales (1/3 en cada)": 3 strategy.exit con
+//     qty_percent 33.33/33.33/33.34 y limit en cada TP, todos con el mismo stop
+//     (SL fijo). Alternativas: "TP único 1:1" y "TP único 2:1".
+//   - REGLA DE PROTECCIÓN: al tocar TP2 se mueve el SL a la entrada
+//     (break-even) para el tramo restante: var bool be_done por trade,
+//     reset al entrar, y strategy.exit re-colocado con stop = entrada real
+//     (strategy.position_avg_price). En modo parcial, al tocar TP2 los tramos
+//     TP1 y TP2 ya están cerrados (2R implica cruzar 1R), así que solo queda
+//     re-colocar el tramo TP3.
+//   - Exit por flip contrario: si aparece señal opuesta antes del TP, la
+//     posición vigente se cierra con strategy.close en el mismo cierre de vela
+//     y el flip abre la dirección nueva (reversión). OPCIÓN documentada más
+//     abajo para NO revertir y operar solo desde plano.
+//
+// SIZING POR RIESGO (fórmula documentada):
+//   riesgo_usd     = strategy.equity * risk_pct / 100
+//   riesgo_unidad  = sl_points * syminfo.pointvalue   (valor de 1 punto por unidad)
+//   qty            = riesgo_usd / riesgo_unidad
+//   - Protección de división por cero: si riesgo_unidad <= 0 -> qty = 0 -> SKIP.
+//   - Redondeo hacia abajo: modo CFD fraccional trunca a 2 decimales con
+//     math.floor(qty*100)/100 (default, para que el tester opere con los
+//     defaults 10k/0.5%); modo entero usa math.floor(qty).
+//   - Si qty < min_qty -> SKIP de la operación con label "SKIP: qty < min".
+//
+// LIMITACIONES CONOCIDAS (honestidad del backtest):
+//   - El tester asume un camino OHLC intrabar: una vela que toque a la vez SL y
+//     TP puede resolverse distinto que en real.
+//   - El BE se aplica al CIERRE de la vela que tocó TP2: dentro de esa misma
+//     vela el tramo restante aún tiene el SL original.
+//   - El sizing usa syminfo.pointvalue del feed: verifícalo (CFDs de índices
+//     suelen tener pointvalue=1; futuros no).
+//   - Los niveles SL/TP se calculan con el close de la señal; el fill real se
+//     desvía los ticks de slippage (2 por defecto).
+//   - Las alertas para bot viven en el INDICADOR (alert() JSON); en strategies
+//     las alertas se generan por fills de órdenes (alert_message).
+// ============================================================================
+
+strategy("ZARUS30 v2 Strategy - Validación", overlay=true, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.005, slippage=2, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true, max_labels_count=500, max_lines_count=500)
+
+// ------------------------------------------------------------- Entradas
+int   atr_len  = input.int(10, "Período ATR", minval=1)
+float atr_mult = input.float(3.0, "Multiplicador ATR", minval=0.1)
+
+// SL fijo por activo (manual operativo)
+float us30_sl_pts = input.float(80.0,  "SL US30 (puntos)")
+float nas_sl_pts  = input.float(20.0,  "SL NAS100 (pips)")
+float gold_sl_pts = input.float(12.0,  "SL XAUUSD (puntos)")
+float gjp_sl_pts  = input.float(20.0,  "SL GBPJPY (pips)")
+float btc_sl_pts  = input.float(500.0, "SL BTCUSD (USD)")
+
+// Sesión/killzone opcional (desactivada por defecto)
+bool   use_session = input.bool(false, "Filtrar por sesión/killzone")
+string session_str = input.session("0000-0000", "Sesión permitida (hora del exchange)")
+
+// Sizing por riesgo
+float risk_pct = input.float(0.5, "Riesgo por trade (% del equity)", minval=0.01, step=0.1)
+float min_qty  = input.float(0.01, "Cantidad mínima por orden (contratos)", minval=0.0)
+bool  use_frac = input.bool(true, "Cantidad fraccionaria (CFD); si no, entero con floor")
+
+// Modo de gestión (manual operativo)
+string exit_mode    = input.string("3 TPs parciales (1/3 en cada)", "Modo de gestión", options=["3 TPs parciales (1/3 en cada)", "TP único 1:1", "TP único 2:1"])
+bool   partial_mode = exit_mode == "3 TPs parciales (1/3 en cada)"
+bool   tp_2to1      = exit_mode == "TP único 2:1"
+
+// --------------------------------------------- SL fijo según ticker (v2)
+// Mismo bloque que el indicador: un único if/else if ordenado con fallback US30.
+float  sl_points = us30_sl_pts
+string sl_asset  = "US30 (fallback)"
+if str.contains(syminfo.ticker, "BTC")
+    sl_points := btc_sl_pts
+    sl_asset  := "BTCUSD"
+else if str.contains(syminfo.ticker, "NAS") or str.contains(syminfo.ticker, "USTEC")
+    sl_points := nas_sl_pts
+    sl_asset  := "NAS100"
+else if str.contains(syminfo.ticker, "GBPJPY") or (str.contains(syminfo.ticker, "GBP") and str.contains(syminfo.ticker, "JPY"))
+    sl_points := gjp_sl_pts
+    sl_asset  := "GBPJPY"
+else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+    sl_points := gold_sl_pts
+    sl_asset  := "XAUUSD"
+
+// ------------------------------------------------ Sesión opcional (v2)
+bool session_ok = not use_session or not na(time(timeframe.period, session_str))
+
+// ------------------------------------------- Nube ATR (idéntica a v1)
+float atr_val    = ta.atr(atr_len)
+float upper_band = high - (atr_mult * atr_val)
+float lower_band = low + (atr_mult * atr_val)
+
+var float trail_stop = na
+var int   trend_dir  = 0
+var int   prev_dir   = 0
+
+// ---------------------------------------------------------------
+// FIX NO-REPAINT (copia exacta del bloque corregido del indicador):
+// el estado solo se muta con vela confirmada; flip decidido en la vela cerrada.
+// ---------------------------------------------------------------
+bool flip_up = false
+bool flip_dn = false
+if barstate.isconfirmed
+    prev_dir := trend_dir
+    if na(trail_stop)
+        trail_stop := close
+        trend_dir  := 1
+    if trend_dir == 1
+        if close < trail_stop
+            trend_dir  := -1
+            trail_stop := lower_band
+        else
+            trail_stop := math.max(trail_stop, upper_band)
+    else
+        if close > trail_stop
+            trend_dir  := 1
+            trail_stop := upper_band
+        else
+            trail_stop := math.min(trail_stop, lower_band)
+    flip_up := trend_dir == 1 and prev_dir == -1
+    flip_dn := trend_dir == -1 and prev_dir == 1
+
+bool buy_signal  = flip_up and session_ok and bar_index >= 2
+bool sell_signal = flip_dn and session_ok and bar_index >= 2
+
+// --------------------------------------------------- Sizing por riesgo
+float point_value   = syminfo.pointvalue
+float equity_now    = strategy.equity
+float risk_money    = equity_now * risk_pct / 100.0
+float risk_per_unit = sl_points * point_value
+float qty_raw       = risk_per_unit > 0 ? risk_money / risk_per_unit : 0.0
+float qty_contracts = use_frac ? math.floor(qty_raw * 100.0) / 100.0 : math.floor(qty_raw) * 1.0
+bool  qty_ok        = not na(qty_contracts) and qty_contracts > 0 and qty_contracts >= min_qty
+
+// ------------------------------------- Estado por trade (reset al entrar)
+var float entry_px = na
+var float sl_px    = na
+var float tp1_px   = na
+var float tp2_px   = na
+var float tp3_px   = na
+var bool  be_done  = false
+
+// -------------------------------- Exit por flip contrario (manual)
+// La señal opuesta CIERRA la posición vigente con strategy.close en el cierre
+// de la vela; el mismo flip abre la dirección nueva (reversión) en los bloques
+// de entrada de abajo. OPCIÓN (si prefieres NO revertir y solo cerrar,
+// re-entrando en el siguiente flip desde plano): añade
+// "and strategy.position_size == 0" a go_long y go_short.
+if buy_signal and strategy.position_size < 0
+    strategy.close("S", comment="Flip contrario")
+if sell_signal and strategy.position_size > 0
+    strategy.close("L", comment="Flip contrario")
+
+bool go_long  = buy_signal  and strategy.position_size <= 0 and qty_ok
+bool go_short = sell_signal and strategy.position_size >= 0 and qty_ok
+
+// ------------------------------------------------------- Entradas
+// Long: desde plano, o revirtiendo un corto (strategy.close anterior +
+// strategy.entry en el mismo cierre = reversión). pyramiding=0 impide
+// añadir en la misma dirección.
+if go_long
+    strategy.entry("L", strategy.long, qty=qty_contracts, comment="BUY flip")
+    entry_px := close
+    sl_px    := close - sl_points
+    tp1_px   := close + sl_points
+    tp2_px   := close + 2.0 * sl_points
+    tp3_px   := close + 3.0 * sl_points
+    be_done  := false
+    if partial_mode
+        strategy.exit("L-TP1", from_entry="L", qty_percent=33.33, limit=tp1_px, stop=sl_px, comment="TP1")
+        strategy.exit("L-TP2", from_entry="L", qty_percent=33.33, limit=tp2_px, stop=sl_px, comment="TP2")
+        strategy.exit("L-TP3", from_entry="L", qty_percent=33.34, limit=tp3_px, stop=sl_px, comment="TP3")
+    else if tp_2to1
+        strategy.exit("L-TP1", from_entry="L", qty_percent=100, limit=tp2_px, stop=sl_px, comment="TP 2:1")
+    else
+        strategy.exit("L-TP1", from_entry="L", qty_percent=100, limit=tp1_px, stop=sl_px, comment="TP 1:1")
+
+if go_short
+    strategy.entry("S", strategy.short, qty=qty_contracts, comment="SELL flip")
+    entry_px := close
+    sl_px    := close + sl_points
+    tp1_px   := close - sl_points
+    tp2_px   := close - 2.0 * sl_points
+    tp3_px   := close - 3.0 * sl_points
+    be_done  := false
+    if partial_mode
+        strategy.exit("S-TP1", from_entry="S", qty_percent=33.33, limit=tp1_px, stop=sl_px, comment="TP1")
+        strategy.exit("S-TP2", from_entry="S", qty_percent=33.33, limit=tp2_px, stop=sl_px, comment="TP2")
+        strategy.exit("S-TP3", from_entry="S", qty_percent=33.34, limit=tp3_px, stop=sl_px, comment="TP3")
+    else if tp_2to1
+        strategy.exit("S-TP1", from_entry="S", qty_percent=100, limit=tp2_px, stop=sl_px, comment="TP 2:1")
+    else
+        strategy.exit("S-TP1", from_entry="S", qty_percent=100, limit=tp1_px, stop=sl_px, comment="TP 1:1")
+
+// SKIP visible cuando hay señal válida pero el sizing no alcanza el mínimo
+if buy_signal and not qty_ok and strategy.position_size <= 0
+    label.new(bar_index, low, "SKIP: qty < min", style=label.style_label_up, color=color.gray, textcolor=color.white, size=size.tiny)
+if sell_signal and not qty_ok and strategy.position_size >= 0
+    label.new(bar_index, high, "SKIP: qty < min", style=label.style_label_down, color=color.gray, textcolor=color.white, size=size.tiny)
+
+// --------------- REGLA DE PROTECCIÓN: TP2 tocado -> SL a entrada (BE)
+// Toque detectado con high/low de la vela; se ejecuta en su cierre. El tramo
+// restante se re-coloca con stop = strategy.position_avg_price (entrada real).
+// Modo parcial: al tocar TP2, TP1 y TP2 ya están cerrados -> solo queda TP3.
+// Modo 1:1: el TP (1R) cierra antes de llegar a 2R (bloque inalcanzable, se
+// deja por simetría y seguridad). Modo 2:1: el TP está en 2R (mismo cierre).
+if strategy.position_size > 0 and not be_done
+    float be_lvl_l = entry_px + 2.0 * sl_points
+    if high >= be_lvl_l
+        be_done := true
+        float be_stop_l = strategy.position_avg_price
+        if partial_mode
+            strategy.exit("L-TP3", from_entry="L", qty_percent=100, limit=tp3_px, stop=be_stop_l, comment="TP3+BE")
+        else if tp_2to1
+            strategy.exit("L-TP1", from_entry="L", qty_percent=100, limit=tp2_px, stop=be_stop_l, comment="TP2:1+BE")
+        else
+            strategy.exit("L-TP1", from_entry="L", qty_percent=100, limit=tp1_px, stop=be_stop_l, comment="TP1:1+BE")
+if strategy.position_size < 0 and not be_done
+    float be_lvl_s = entry_px - 2.0 * sl_points
+    if low <= be_lvl_s
+        be_done := true
+        float be_stop_s = strategy.position_avg_price
+        if partial_mode
+            strategy.exit("S-TP3", from_entry="S", qty_percent=100, limit=tp3_px, stop=be_stop_s, comment="TP3+BE")
+        else if tp_2to1
+            strategy.exit("S-TP1", from_entry="S", qty_percent=100, limit=tp2_px, stop=be_stop_s, comment="TP2:1+BE")
+        else
+            strategy.exit("S-TP1", from_entry="S", qty_percent=100, limit=tp1_px, stop=be_stop_s, comment="TP1:1+BE")
+
+// ----------------------------------------------------------------- Visual
+p_price = plot(hl2, display=display.none)
+p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
+fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 85) : color.new(color.red, 85))
+
+var table info_tbl = table.new(position.top_right, 1, 2)
+if barstate.islast
+    table.cell(info_tbl, 0, 0, "ZARUS30 v2 STG | " + sl_asset, text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=size.small)
+    table.cell(info_tbl, 0, 1, "SL: " + str.tostring(sl_points, format.mintick) + " | Riesgo: " + str.tostring(risk_pct, "#.##") + "%", text_color=color.white, bgcolor=color.new(color.gray, 25), text_size=size.small)
