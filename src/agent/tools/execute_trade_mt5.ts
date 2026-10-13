@@ -1,5 +1,6 @@
 import type { Tool } from "../types.js";
 import { MT5Bridge, type MT5OrderRequest, type MT5SymbolInfo } from "../../config/mt5bridge.js";
+import { getSlForSymbol } from "../../config/asset_risk_table.js"; // Task 11-a: tabla única de SL por activo (solo fallback)
 import {
   getRecentExecuteDecision,
   claimDecision,
@@ -238,11 +239,24 @@ export const executeTradeMT5: Tool = {
     const {
       symbol: rawSymbol,
       direction,
-      stopLossPips,
+      stopLossPips: stopLossPipsArg,
       riskPercentage,
       comment = "Bot-SMC-v3"
     } = args as unknown as ExecuteTradeArgs;
     const symbol = String(rawSymbol).trim().toUpperCase();
+
+    // Task 11-a: si la orden NO TRAE SL explícito (campo ausente/null/NaN) y
+    // el símbolo resuelve en la tabla única de SL por activo
+    // (asset_risk_table.ts), ese valor es el fallback — LÍNEA DE INTEGRACIÓN
+    // de la tabla. Un SL explícito pero inválido (0, negativo) NO se
+    // sustituye: se mantiene y el chequeo de sanidad de más abajo lo rechaza
+    // (fail-closed intacto, nunca se inventa un SL donde el llamador envió
+    // basura). Si la decisión vigente trae SL del plan, el hard-gate manda
+    // (tolerancia 0.5x–1.25x).
+    const stopLossPips: number =
+      stopLossPipsArg != null && Number.isFinite(stopLossPipsArg)
+        ? stopLossPipsArg
+        : getSlForSymbol(symbol) ?? stopLossPipsArg;
 
     // ── HARD-GATE (SOP v3.2, one-shot, SIEMPRE activo) ──
     let gatedDecisionId: number | undefined;

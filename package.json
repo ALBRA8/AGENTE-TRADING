@@ -8,7 +8,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe') && npm run test:e2e",
+    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe') && tsx tests/position_management.test.ts && npm run test:e2e",
     "test:e2e": "tsx tests/e2e_pipeline.ts"
   },
   "dependencies": {

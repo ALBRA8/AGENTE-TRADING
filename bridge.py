@@ -367,6 +367,127 @@ def place_order():
     })
 
 
+@app.route("/modify_position", methods=["POST"])
+def modify_position():
+    """
+    Modifica el SL/TP de una posición ABIERTA (Task 11-a — "Regla de
+    protección" del manual operativo: al tocar TP2/TP1 el gestor de
+    posiciones mueve el SL a break-even vía este endpoint).
+    Body JSON:
+    {
+      "ticket": 123456789,   (prioridad sobre symbol; si se envía symbol
+      "symbol": "US30",       y hay varias posiciones → se exige ticket)
+      "sl": 12300.0,         (nuevo SL; opcional si se envía tp)
+      "tp": 12500.0          (nuevo TP; opcional si se envía sl)
+    }
+    Usa mt5.TRADE_ACTION_SLTP. Validaciones fail-closed:
+      - mismo candado X-AGT-Token que /order y /cancel,
+      - la posición debe existir (si no → 404 limpio, sin stack traces),
+      - el SL NUNCA puede aumentar el riesgo: para un LONG debe quedar
+        por debajo del bid actual y NO por debajo del SL actual (alejar
+        el stop); para un SHORT por encima del ask y NO por encima del
+        SL actual.
+    """
+    body = request.get_json(force=True)
+    if not body:
+        return jsonify({"error": "Body JSON requerido"}), 400
+
+    # ── Mismo candado de escritura que el resto de endpoints (§5/§23) ──
+    denied = check_bridge_token()
+    if denied:
+        return denied
+    if not request.is_json:
+        return jsonify({"error": "Content-Type debe ser application/json"}), 415
+
+    raw_ticket = body.get("ticket")
+    symbol     = body.get("symbol", "")
+    new_sl     = body.get("sl")
+    new_tp     = body.get("tp")
+
+    if new_sl is None and new_tp is None:
+        return jsonify({"error": "Debe enviarse al menos 'sl' o 'tp' a modificar"}), 400
+
+    # Parseo defensivo: errores limpios 400, nunca stack traces (estilo /order)
+    try:
+        new_sl = float(new_sl) if new_sl is not None else None
+        new_tp = float(new_tp) if new_tp is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"error": f"sl/tp deben ser números (sl={new_sl!r}, tp={new_tp!r})"}), 400
+    if new_sl is not None and new_sl <= 0:
+        return jsonify({"error": f"SL inválido: {new_sl} (un SL de 0 o negativo eliminaría la protección)"}), 400
+    if new_tp is not None and new_tp <= 0:
+        return jsonify({"error": f"TP inválido: {new_tp} (un TP de 0 o negativo eliminaría la toma de beneficios)"}), 400
+
+    # ── Localizar la posición abierta (rechazo honesto si no existe) ──
+    if raw_ticket is not None:
+        try:
+            ticket = int(raw_ticket)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"ticket inválido: {raw_ticket!r}"}), 400
+        positions = mt5.positions_get(ticket=ticket)
+    elif symbol:
+        positions = mt5.positions_get(symbol=normalize_symbol(symbol.upper()))
+    else:
+        return jsonify({"error": "Se requiere 'ticket' o 'symbol' para identificar la posición"}), 400
+
+    if positions is None or len(positions) == 0:
+        return jsonify({"error": f"Posición no encontrada en MT5 (ticket={raw_ticket!r}, symbol={symbol!r})"}), 404
+    if len(positions) > 1:
+        # Fail-closed: modificar N posiciones con una sola llamada es ambiguo
+        return jsonify({"error": f"El símbolo {symbol} tiene {len(positions)} posiciones abiertas: envía el 'ticket' concreto"}), 409
+
+    pos = positions[0]
+    is_long = pos.type == mt5.POSITION_TYPE_BUY
+
+    # ── Validación de lado del SL (rechazar SL que aumentaría el riesgo) ──
+    if new_sl is not None:
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            return jsonify({"error": f"No se pudo obtener el precio actual de {pos.symbol}", "detail": str(mt5.last_error())}), 500
+        if is_long:
+            if new_sl >= tick.bid:
+                return jsonify({"error": f"SL inválido para posición LONG {pos.symbol}: {new_sl} debe ser < bid actual ({tick.bid})"}), 400
+            if pos.sl > 0 and new_sl < pos.sl:
+                return jsonify({"error": f"SL {new_sl} alejaría el stop del LONG (SL actual {pos.sl}): no se acepta un SL que aumente el riesgo"}), 400
+        else:
+            if new_sl <= tick.ask:
+                return jsonify({"error": f"SL inválido para posición SHORT {pos.symbol}: {new_sl} debe ser > ask actual ({tick.ask})"}), 400
+            if pos.sl > 0 and new_sl > pos.sl:
+                return jsonify({"error": f"SL {new_sl} alejaría el stop del SHORT (SL actual {pos.sl}): no se acepta un SL que aumente el riesgo"}), 400
+
+    request_data = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "position": pos.ticket,
+        "symbol":   pos.symbol,
+        # Los campos no enviados se mantienen tal cual (no se tocan)
+        "sl":       new_sl if new_sl is not None else pos.sl,
+        "tp":       new_tp if new_tp is not None else pos.tp,
+    }
+
+    log.info(f"Modificando posición {pos.ticket} ({pos.symbol}): sl={request_data['sl']}, tp={request_data['tp']}")
+    result = mt5.order_send(request_data)
+
+    if result is None:
+        return jsonify({"error": "order_send devolvió None", "detail": str(mt5.last_error())}), 500
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return jsonify({
+            "error":   f"Modificación rechazada por MT5 (retcode: {result.retcode})",
+            "comment": result.comment,
+            "retcode": result.retcode,
+        }), 400
+
+    log.info(f"Posición modificada: ticket={pos.ticket}, retcode={result.retcode}")
+    return jsonify({
+        "success": True,
+        "ticket":  pos.ticket,
+        "symbol":  pos.symbol,
+        "type":    "BUY" if is_long else "SELL",
+        "sl":      request_data["sl"],
+        "tp":      request_data["tp"],
+    })
+
+
 @app.route("/positions", methods=["GET"])
 def get_positions():
     """Lista las posiciones abiertas actuales."""
@@ -449,6 +570,7 @@ if __name__ == "__main__":
     log.info("  GET  /positions")
     log.info("  GET  /orders")
     log.info("  POST /order")
+    log.info("  POST /modify_position")
     log.info("  DELETE /cancel/<ticket>")
 
     try:
