@@ -31,9 +31,13 @@
 //   8. GRÁFICO LIMPIO (Task 11-e): por defecto SOLO se muestra el último setup
 //      (los niveles SL/TP de señales anteriores se borran solos); el histórico
 //      de entradas queda como etiquetas pequeñas BUY/SELL. Toggles configurables.
-//   9. ZONAS SMC (Task 11-f): FVG inmaculados (cajas que persisten hasta
-//      mitigación por cierre o expiración) y marcas BOS/CHoCH por pivotes —
-//      detección solo con vela confirmada (mismo estándar no-repaint).
+//   9. ZONAS DE INTERÉS SMC (Task 11-f): zonas OB estilo usuario — cuando el
+//      CIERRE rompe el último swing confirmado nace la zona de COMPRA (azul,
+//      sobre el último mínimo) o de VENTA (roja, bajo el último máximo); la
+//      zona activa se extiende hacia la derecha y se congela al ser mitigada
+//      (invasión total). FVG inmaculados y marcas BOS/CHoCH quedan como
+//      opciones extra (off por defecto). Detección solo con vela confirmada
+//      (mismo estándar no-repaint).
 //
 // CÓMO ACTIVAR LA ALERTA WEBHOOK (para el bot):
 //   1. Cargar este script en el gráfico del activo y TF deseados (M5/M15).
@@ -69,13 +73,17 @@ string session_str = input.session("0000-0000", "Sesión permitida (hora del exc
 bool clean_chart = input.bool(true, "Solo el último setup (borra niveles de señales anteriores)")
 bool show_levels = input.bool(true, "Proyectar niveles SL/TP1/TP2/TP3")
 
-// Zonas SMC (Task 11-f)
-bool  show_fvg     = input.bool(true,  "Mostrar FVG (zonas de interés)", group="Zonas SMC")
-int   max_fvg      = input.int(3,       "Máx. FVG activos por lado", minval=1, maxval=10, group="Zonas SMC")
-int   fvg_max_age  = input.int(150,     "Expiración FVG (barras)", minval=20, group="Zonas SMC")
-float fvg_min_atr  = input.float(0.1,   "Tamaño mín. FVG (× ATR)", minval=0.0, step=0.05, group="Zonas SMC")
-bool  show_bos     = input.bool(true,  "Marcas BOS / CHoCH", group="Zonas SMC")
-int   pivot_len    = input.int(5,       "Pivotes para estructura", minval=2, group="Zonas SMC")
+// Zonas de interés SMC (Task 11-f): OB por ruptura de estructura + FVG opcional
+bool  show_ob     = input.bool(true,  "Zonas OB (compra/venta)", group="Zonas de Interés (SMC)")
+int   ob_left     = input.int(5,      "Pivotes Izquierda OB", minval=1, group="Zonas de Interés (SMC)")
+int   ob_right    = input.int(3,      "Pivotes Derecha OB", minval=1, group="Zonas de Interés (SMC)")
+int   ob_max      = input.int(3,      "Máx. zonas activas por lado", minval=1, maxval=10, group="Zonas de Interés (SMC)")
+float ob_zone_atr = input.float(0.7,  "Altura de la zona (× ATR)", minval=0.1, step=0.1, group="Zonas de Interés (SMC)")
+bool  show_fvg    = input.bool(false, "Mostrar FVG (opcional)", group="Zonas de Interés (SMC)")
+int   max_fvg     = input.int(3,      "Máx. FVG activos por lado", minval=1, maxval=10, group="Zonas de Interés (SMC)")
+int   fvg_max_age = input.int(150,    "Expiración FVG (barras)", minval=20, group="Zonas de Interés (SMC)")
+float fvg_min_atr = input.float(0.1,  "Tamaño mín. FVG (× ATR)", minval=0.0, step=0.05, group="Zonas de Interés (SMC)")
+bool  show_bos    = input.bool(false, "Marcas BOS / CHoCH", group="Zonas de Interés (SMC)")
 
 // --------------------------------------------- SL fijo según ticker (v2)
 // Detección del activo por ticker en un único bloque if/else if, ordenado de
@@ -172,19 +180,35 @@ if sell_signal
     tp3_price   := close - 3.0 * sl_points
 
 // ============================================================================
-// ZONAS SMC (Task 11-f): FVG inmaculados + BOS/CHoCH
+// ZONAS DE INTERÉS SMC (Task 11-f): Order Blocks por ruptura de estructura
+// (estilo pedido por el usuario) + FVG opcional + BOS/CHoCH opcional.
 // Detección y mutación de estado SOLO en barstate.isconfirmed (no-repaint).
-//   - FVG alcista:  low > high[2]  -> zona [high[2], low]  (3 velas)
-//   - FVG bajista:  high < low[2]  -> zona [high, low[2]]
-//   - Mitigación por CIERRE a través de la zona (estándar inmaculado); el
-//     toque solo es el retest (la caja sigue viva = POI valida entrada).
-//   - Máx. cajas por lado + expiración: gráfico siempre legible.
+//
+//   - Swing: último pivote confirmado (pivothigh/pivotlow izq/der).
+//   - Ruptura alcista: el CIERRE cruza por encima del último swing high ->
+//     nace "ZONA DE COMPRA (OB)" sobre el último swing low:
+//     top = swing low, bottom = swing low - altura*ATR (caja azul).
+//   - Ruptura bajista: el CIERRE cruza por debajo del último swing low ->
+//     nace "ZONA DE VENTA (OB)" bajo el último swing high:
+//     top = swing high + altura*ATR, bottom = swing high (caja roja).
+//   - La zona activa se extiende hacia la derecha; cuando el precio la invade
+//     por COMPLETO (low < bottom / high > top) se congela en la vela de
+//     mitigación (queda como histórico POI) y deja de gestionarse.
+//   - Tope de zonas activas por lado (se elimina la más antigua).
 // ============================================================================
-float ph = ta.pivothigh(pivot_len, pivot_len)
-float pl = ta.pivotlow(pivot_len, pivot_len)
+float ph = ta.pivothigh(ob_left, ob_right)
+float pl = ta.pivotlow(ob_left, ob_right)
 var float swing_hi   = na
 var float swing_lo   = na
 var int   struct_dir = 1
+
+type OBZone
+    box   b
+    float top
+    float btm
+
+var array<OBZone> obs_bull = array.new<OBZone>()
+var array<OBZone> obs_bear = array.new<OBZone>()
 
 var array<box>   fvg_bull     = array.new<box>()
 var array<box>   fvg_bear     = array.new<box>()
@@ -194,12 +218,55 @@ var array<int>   fvg_bull_bar = array.new<int>()
 var array<int>   fvg_bear_bar = array.new<int>()
 
 if barstate.isconfirmed
-    // ── Estructura: pivotes confirmados
+    // ── Swing: pivotes confirmados
     if not na(ph)
         swing_hi := ph
     if not na(pl)
         swing_lo := pl
-    // ── Mitigación / expiración de FVG (recorrido inverso para poder remove)
+    // ── Ruptura de estructura: el CIERRE cruza el swing vigente (solo el
+    //    cruce inicial; sin re-disparos mientras el cierre siga del mismo lado)
+    bool broke_hi = not na(swing_hi) and close > swing_hi and close[1] <= swing_hi
+    bool broke_lo = not na(swing_lo) and close < swing_lo and close[1] >= swing_lo
+    // ── Marcas BOS / CHoCH (opcional, off por defecto)
+    if show_bos and broke_hi
+        label.new(bar_index, high, struct_dir == -1 ? "CHoCH" : "BOS", style=label.style_label_down, color=color.new(struct_dir == -1 ? color.orange : color.teal, 20), textcolor=color.white, size=size.tiny)
+        struct_dir := 1
+    if show_bos and broke_lo
+        label.new(bar_index, low, struct_dir == 1 ? "CHoCH" : "BOS", style=label.style_label_up, color=color.new(struct_dir == 1 ? color.orange : color.red, 20), textcolor=color.white, size=size.tiny)
+        struct_dir := -1
+    // ── Zonas OB: la ruptura deja la zona en el pivote opuesto (estilo usuario)
+    if show_ob and broke_hi and not na(swing_lo) and not na(atr_val) and swing_lo < close
+        float z_top = swing_lo
+        float z_btm = swing_lo - ob_zone_atr * atr_val
+        array.push(obs_bull, OBZone.new(box.new(math.max(0, bar_index - ob_right - 5), z_top, bar_index + 15, z_btm, bgcolor=color.new(color.blue, 85), border_color=color.blue, border_width=1, text="ZONA DE COMPRA (OB)", text_size=size.tiny, text_color=color.new(color.blue, 15)), z_top, z_btm))
+        swing_hi := na
+        if array.size(obs_bull) > ob_max
+            OBZone old_b = array.shift(obs_bull)
+            box.delete(old_b.b)
+    if show_ob and broke_lo and not na(swing_hi) and not na(atr_val) and swing_hi > close
+        float z_top = swing_hi + ob_zone_atr * atr_val
+        float z_btm = swing_hi
+        array.push(obs_bear, OBZone.new(box.new(math.max(0, bar_index - ob_right - 5), z_top, bar_index + 15, z_btm, bgcolor=color.new(color.red, 85), border_color=color.red, border_width=1, text="ZONA DE VENTA (OB)", text_size=size.tiny, text_color=color.new(color.red, 15)), z_top, z_btm))
+        swing_lo := na
+        if array.size(obs_bear) > ob_max
+            OBZone old_s = array.shift(obs_bear)
+            box.delete(old_s.b)
+    // ── Gestión de zonas OB activas: extensión + mitigación (invasión total)
+    if array.size(obs_bull) > 0
+        for i = array.size(obs_bull) - 1 to 0
+            OBZone zb = array.get(obs_bull, i)
+            box.set_right(zb.b, bar_index + 10)
+            if low < zb.btm
+                box.set_right(zb.b, bar_index)
+                array.remove(obs_bull, i)
+    if array.size(obs_bear) > 0
+        for i = array.size(obs_bear) - 1 to 0
+            OBZone zs = array.get(obs_bear, i)
+            box.set_right(zs.b, bar_index + 10)
+            if high > zs.top
+                box.set_right(zs.b, bar_index)
+                array.remove(obs_bear, i)
+    // ── Mitigación / expiración de FVG (opcional; recorrido inverso para remove)
     if array.size(fvg_bull) > 0
         for i = array.size(fvg_bull) - 1 to 0
             if close < array.get(fvg_bull_bot, i) or bar_index - array.get(fvg_bull_bar, i) > fvg_max_age
@@ -231,14 +298,6 @@ if barstate.isconfirmed
             box.delete(array.shift(fvg_bear))
             array.shift(fvg_bear_top)
             array.shift(fvg_bear_bar)
-    // ── BOS / CHoCH: primera vez que el CIERRE rompe un swing confirmado
-    //    (etiqueta en la vela de ruptura, sin spam: solo el cruce inicial)
-    if show_bos and not na(swing_hi) and close > swing_hi and close[1] <= swing_hi
-        label.new(bar_index, high, struct_dir == -1 ? "CHoCH" : "BOS", style=label.style_label_down, color=color.new(struct_dir == -1 ? color.orange : color.teal, 20), textcolor=color.white, size=size.tiny)
-        struct_dir := 1
-    if show_bos and not na(swing_lo) and close < swing_lo and close[1] >= swing_lo
-        label.new(bar_index, low, struct_dir == 1 ? "CHoCH" : "BOS", style=label.style_label_up, color=color.new(struct_dir == 1 ? color.orange : color.red, 20), textcolor=color.white, size=size.tiny)
-        struct_dir := -1
 
 // ----------------------------------------------------------------- Dibujo
 p_price = plot(hl2, display=display.none)
