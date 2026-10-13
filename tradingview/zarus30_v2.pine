@@ -28,6 +28,9 @@
 //   6. TP1/TP2/TP3 = entry ± 1R/2R/3R (R = SL fijo del activo), líneas
 //      proyectadas 25 barras con labels de precio (SL, TP1, TP2, TP3).
 //   7. Archivo compañero: zarus30_v2_strategy.pine (la evidencia de backtest).
+//   8. GRÁFICO LIMPIO (Task 11-e): por defecto SOLO se muestra el último setup
+//      (los niveles SL/TP de señales anteriores se borran solos); el histórico
+//      de entradas queda como etiquetas pequeñas BUY/SELL. Toggles configurables.
 //
 // CÓMO ACTIVAR LA ALERTA WEBHOOK (para el bot):
 //   1. Cargar este script en el gráfico del activo y TF deseados (M5/M15).
@@ -58,6 +61,10 @@ float btc_sl_pts  = input.float(500.0, "SL BTCUSD (USD)")
 // Sesión/killzone opcional (desactivada por defecto)
 bool   use_session = input.bool(false, "Filtrar por sesión/killzone")
 string session_str = input.session("0000-0000", "Sesión permitida (hora del exchange)")
+
+// Legibilidad del gráfico (Task 11-e)
+bool clean_chart = input.bool(true, "Solo el último setup (borra niveles de señales anteriores)")
+bool show_levels = input.bool(true, "Proyectar niveles SL/TP1/TP2/TP3")
 
 // --------------------------------------------- SL fijo según ticker (v2)
 // Detección del activo por ticker en un único bloque if/else if, ordenado de
@@ -158,30 +165,42 @@ p_price = plot(hl2, display=display.none)
 p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
 fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 85) : color.new(color.red, 85))
 
-// Señal + líneas proyectadas 25 barras (SL/TP1/TP2/TP3) con labels de precio.
+// Task 11-e: registro de los niveles dibujados para poder limpiarlos.
+// Las etiquetas BUY/SELL NO se registran: el histórico de entradas queda.
+var array<line>  lvl_lines  = array.new<line>()
+var array<label> lvl_labels = array.new<label>()
+if (buy_signal or sell_signal) and clean_chart
+    while array.size(lvl_lines) > 0
+        line.delete(array.pop(lvl_lines))
+    while array.size(lvl_labels) > 0
+        label.delete(array.pop(lvl_labels))
+
+// Señal + niveles proyectados 25 barras (SL/TP1/TP2/TP3).
 // Solo se ejecutan UNA vez (vela confirmada del flip) -> sin repintado.
 if buy_signal
-    label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
-    int x2 = bar_index + 25
-    line.new(bar_index, sl_price, x2, sl_price, color=color.red, width=2)
-    line.new(bar_index, tp1_price, x2, tp1_price, color=color.green, width=1)
-    line.new(bar_index, tp2_price, x2, tp2_price, color=color.green, width=1)
-    line.new(bar_index, tp3_price, x2, tp3_price, color=color.green, width=1)
-    label.new(x2, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
-    label.new(x2, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
-    label.new(x2, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
-    label.new(x2, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
+    if show_levels
+        int x2 = bar_index + 25
+        array.push(lvl_lines, line.new(bar_index, sl_price, x2, sl_price, color=color.new(color.red, 0), width=2))
+        array.push(lvl_lines, line.new(bar_index, tp1_price, x2, tp1_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_lines, line.new(bar_index, tp2_price, x2, tp2_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_lines, line.new(bar_index, tp3_price, x2, tp3_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_labels, label.new(x2, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.new(color.red, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
 if sell_signal
-    label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
-    int x2s = bar_index + 25
-    line.new(bar_index, sl_price, x2s, sl_price, color=color.red, width=2)
-    line.new(bar_index, tp1_price, x2s, tp1_price, color=color.green, width=1)
-    line.new(bar_index, tp2_price, x2s, tp2_price, color=color.green, width=1)
-    line.new(bar_index, tp3_price, x2s, tp3_price, color=color.green, width=1)
-    label.new(x2s, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
-    label.new(x2s, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
-    label.new(x2s, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
-    label.new(x2s, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
+    if show_levels
+        int x2s = bar_index + 25
+        array.push(lvl_lines, line.new(bar_index, sl_price, x2s, sl_price, color=color.new(color.red, 0), width=2))
+        array.push(lvl_lines, line.new(bar_index, tp1_price, x2s, tp1_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_lines, line.new(bar_index, tp2_price, x2s, tp2_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_lines, line.new(bar_index, tp3_price, x2s, tp3_price, color=color.new(color.teal, 25), width=1))
+        array.push(lvl_labels, label.new(x2s, sl_price, "SL " + str.tostring(sl_price, format.mintick), style=label.style_label_left, color=color.new(color.red, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2s, tp1_price, "TP1 " + str.tostring(tp1_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2s, tp2_price, "TP2 " + str.tostring(tp2_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
+        array.push(lvl_labels, label.new(x2s, tp3_price, "TP3 " + str.tostring(tp3_price, format.mintick), style=label.style_label_left, color=color.new(color.teal, 25), textcolor=color.white, size=size.tiny))
 
 // ---------------------------------------------------------------- Alertas
 // alertcondition: placeholders {{ticker}} y {{close}} los resuelve TradingView.
