@@ -16,6 +16,10 @@
 //      GBPJPY=20 y BTCUSD=500 (antes el resto caia en SL de US30 por error).
 //   5. ALERTAS: alertcondition() + alert() JSON (action/symbol/price/sl/tp1/
 //      tp2/tp3) para conectar el bot por webhook. Sin efecto visual.
+//   6. LÍNEA MORADA DE GATILLO (breaker/retest): en cada señal se marca el
+//      extremo de la vela previa (low[1] en venta, high[1] en compra) como
+//      nivel de retroceso/retest, proyectada proj_bars velas. Se autolimpia
+//      con cada señal nueva (misma gestión que el resto de líneas).
 //
 // Cómo activar la alerta para el bot:
 //   Crear alerta -> Condicion = "Cualquier llamada a la funcion alert()"
@@ -98,6 +102,9 @@ var label lb_tp1 = na
 var label lb_tp2 = na
 var label lb_tp3 = na
 
+// --- LÍNEA MORADA DE RETROCESO / GATILLO (BREAKER / RETEST LEVEL) ---
+var line ln_trigger_purple = na
+
 f_limpiar_lineas() =>
     line.delete(l_entry)
     line.delete(l_sl)
@@ -108,6 +115,7 @@ f_limpiar_lineas() =>
     label.delete(lb_tp1)
     label.delete(lb_tp2)
     label.delete(lb_tp3)
+    line.delete(ln_trigger_purple)
 
 if buy_trigger
     f_limpiar_lineas()
@@ -156,6 +164,19 @@ if sell_trigger
 
     // Alerta JSON para el bot (arreglo 5, sin efecto visual)
     alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + '}', alert.freq_once_per_bar_close)
+
+// --- LÍNEA MORADA DE RETROCESO / GATILLO (BREAKER / RETEST LEVEL) ---
+if sell_trigger
+    // Se elimina la anterior para mantener el gráfico limpio
+    line.delete(ln_trigger_purple)
+    // Nivel morado: mínimo de la vela que confirma el quiebre o nivel de entrada exacto
+    purple_level = low[1]
+    ln_trigger_purple := line.new(bar_index, purple_level, bar_index + proj_bars, purple_level, color=color.rgb(155, 38, 206), width=2, style=line.style_solid)
+
+if buy_trigger
+    line.delete(ln_trigger_purple)
+    purple_level = high[1]
+    ln_trigger_purple := line.new(bar_index, purple_level, bar_index + proj_bars, purple_level, color=color.rgb(155, 38, 206), width=2, style=line.style_solid)
 
 // --- ZONAS DE INTERÉS (ORDER BLOCKS) CON MITIGACIÓN ---
 p_high = ta.pivothigh(high, left_bars, right_bars)
