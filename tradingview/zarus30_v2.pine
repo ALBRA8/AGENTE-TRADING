@@ -1,25 +1,28 @@
 //@version=5
 // ============================================================================
-// ZARUS30 Clone - Zonas OB & Vista Limpia (v2)
+// ZARUS30 Pro - SMC & Premium/Discount (v2)
 // ----------------------------------------------------------------------------
-// Es el MISMO script del usuario, con 5 arreglos INVISIBLES para poder operar
-// de verdad con el (mismo aspecto, mismas senales, mismas zonas):
-//   1. SIN REPINTADO: el estado (trend_dir/trail_stop) y las zonas SOLO se
-//      actualizan al CIERRE de vela (barstate.isconfirmed). Con crossover
-//      intrabar la senal podia aparecer y desaparecer antes del cierre.
+// Base LITERAL del script "ZARUS30 Pro - SMC & Premium/Discount" del usuario
+// (PDH/PDL, canal ATR, pivotes SMC, Strong/Weak, Premium/Discount, CHOCH,
+// zonas OB y línea morada de retesteo dentro de los bloques de ejecución),
+// con 6 arreglos INVISIBLES para poder operar de verdad con el (mismo aspecto,
+// mismas senales, mismas zonas):
+//   1. SIN REPINTADO: el estado (trend_dir/trail_stop), las rupturas de
+//      estructura y la mitigación de zonas SOLO se actualizan al CIERRE de
+//      vela (barstate.isconfirmed). Con crossover intrabar la senal podia
+//      aparecer y desaparecer antes del cierre.
 //   2. ARRANQUE ROBUSTO: se exige direccion previa +/-1 antes de disparar
 //      (prev_dir), inmune a reinicializaciones del estado.
 //   3. ZONAS ROBUSTAS: guardas contra na (la version original podia crashear
-//      creando una caja con precio na en las primeras velas), saneo de zonas
-//      imposibles y left nunca negativo.
+//      creando una caja/linea con precio na en las primeras velas), saneo de
+//      zonas imposibles y left nunca negativo.
 //   4. SL POR ACTIVO: se mantienen US30=80 y Oro=12 y se anaden NAS100=20,
 //      GBPJPY=20 y BTCUSD=500 (antes el resto caia en SL de US30 por error).
 //   5. ALERTAS: alertcondition() + alert() JSON (action/symbol/price/sl/tp1/
 //      tp2/tp3) para conectar el bot por webhook. Sin efecto visual.
-//   6. LÍNEA MORADA DE GATILLO (breaker/retest): en cada señal se marca el
-//      extremo de la vela previa (low[1] en venta, high[1] en compra) como
-//      nivel de retroceso/retest, proyectada proj_bars velas. Se autolimpia
-//      con cada señal nueva (misma gestión que el resto de líneas).
+//   6. ZONAS PD EN LINEA: Pine no permite reasignar variables globales dentro
+//      de una funcion, asi que f_actualizar_pd_zones se expandio inline en
+//      cada ruptura (mismo resultado visual, compilacion garantizada).
 //
 // Cómo activar la alerta para el bot:
 //   Crear alerta -> Condicion = "Cualquier llamada a la funcion alert()"
@@ -27,19 +30,19 @@
 //   de la vela siguiente al aviso (la senal se imprime al cierre).
 // ============================================================================
 
-indicator("ZARUS30 Clone - Zonas OB & Vista Limpia (v2)", overlay=true, max_labels_count=100, max_boxes_count=100, max_lines_count=100)
+indicator("ZARUS30 Pro - SMC & Premium/Discount (v2)", overlay=true, max_labels_count=300, max_boxes_count=150, max_lines_count=150)
 
 // --- PARÁMETROS BASE ---
-atr_len      = input.int(10, "Período ATR", group="Canal de Tendencia")
-atr_mult     = input.float(3.0, "Multiplicador ATR", group="Canal de Tendencia")
-us30_sl_pts  = input.float(80.0, "Stop Loss US30 (Puntos)", group="Gestión de Riesgo")
-nas_sl_pts   = input.float(20.0, "Stop Loss NAS100 (Pips)", group="Gestión de Riesgo")
-gold_sl_pts  = input.float(12.0, "Stop Loss Oro (Puntos)", group="Gestión de Riesgo")
-gjp_sl_pts   = input.float(20.0, "Stop Loss GBPJPY (Pips)", group="Gestión de Riesgo")
-btc_sl_pts   = input.float(500.0, "Stop Loss BTCUSD (USD)", group="Gestión de Riesgo")
-proj_bars    = input.int(20, "Proyección Líneas (Velas)", group="Visualización")
-left_bars    = input.int(5, "Pivotes Izquierda OB", group="Zonas de Interés (SMC)")
-right_bars   = input.int(3, "Pivotes Derecha OB", group="Zonas de Interés (SMC)")
+atr_len      = input.int(10, "Período ATR", group="Canal ATR")
+atr_mult     = input.float(3.0, "Multiplicador ATR", group="Canal ATR")
+us30_sl_pts  = input.float(80.0, "SL US30 (Puntos)", group="Gestión")
+nas_sl_pts   = input.float(20.0, "SL NAS100 (Puntos)", group="Gestión")
+gold_sl_pts  = input.float(12.0, "SL Oro (Puntos)", group="Gestión")
+gjp_sl_pts   = input.float(20.0, "SL GBPJPY (Puntos)", group="Gestión")
+btc_sl_pts   = input.float(500.0, "SL BTC (Puntos)", group="Gestión")
+proj_bars    = input.int(22, "Extensión de Niveles (Velas)", group="Visualización")
+left_bars    = input.int(5, "Pivotes Izq SMC", group="Estructura")
+right_bars   = input.int(3, "Pivotes Der SMC", group="Estructura")
 
 // --- SL POR ACTIVO (arreglo 4: antes solo US30 y Oro) ---
 sl_points = us30_sl_pts
@@ -52,7 +55,14 @@ else if str.contains(syminfo.ticker, "GBPJPY") or (str.contains(syminfo.ticker, 
 else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
     sl_points := gold_sl_pts
 
-// --- CÁLCULO ATR STEPPED (arreglo 1: estado SOLO al cierre de vela) ---
+// --- PREVIOUS DAY HIGH / LOW (PDH / PDL) ---
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+
+plot(pdh, "PDH", color=color.black, linewidth=2, style=plot.style_line)
+plot(pdl, "PDL", color=color.blue, linewidth=2, style=plot.style_line)
+
+// --- CANAL STEPPED ATR (arreglo 1: estado SOLO al cierre de vela) ---
 atr_val    = ta.atr(atr_len)
 upper_band = high - (atr_mult * atr_val)
 lower_band = low + (atr_mult * atr_val)
@@ -90,101 +100,28 @@ p_price = plot(hl2, display=display.none)
 p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.green : color.red, style=plot.style_stepline, linewidth=2)
 fill(p_price, p_band, color=trend_dir == 1 ? color.new(color.green, 88) : color.new(color.red, 88))
 
-// --- GESTIÓN DE LÍNEAS DE TRADE ACTIVO (SIN ACUMULACIÓN) ---
-var line l_entry = na
-var line l_sl    = na
-var line l_tp1   = na
-var line l_tp2   = na
-var line l_tp3   = na
-
-var label lb_sl  = na
-var label lb_tp1 = na
-var label lb_tp2 = na
-var label lb_tp3 = na
-
-// --- LÍNEA MORADA DE RETROCESO / GATILLO (BREAKER / RETEST LEVEL) ---
-var line ln_trigger_purple = na
-
-f_limpiar_lineas() =>
-    line.delete(l_entry)
-    line.delete(l_sl)
-    line.delete(l_tp1)
-    line.delete(l_tp2)
-    line.delete(l_tp3)
-    label.delete(lb_sl)
-    label.delete(lb_tp1)
-    label.delete(lb_tp2)
-    label.delete(lb_tp3)
-    line.delete(ln_trigger_purple)
-
-if buy_trigger
-    f_limpiar_lineas()
-    entry = close
-    sl    = entry - sl_points
-    tp1   = entry + (sl_points * 1.0)
-    tp2   = entry + (sl_points * 2.0)
-    tp3   = entry + (sl_points * 3.0)
-
-    label.new(bar_index, low - (atr_val * 0.4), "BUY", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
-
-    l_entry := line.new(bar_index, entry, bar_index + proj_bars, entry, color=color.gray, width=1, style=line.style_dotted)
-    l_sl    := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
-    l_tp1   := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.teal, width=1)
-    l_tp2   := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.teal, width=2)
-    l_tp3   := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.teal, width=1)
-
-    lb_sl   := label.new(bar_index + proj_bars, sl, "SL: " + str.tostring(sl, "#"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp1  := label.new(bar_index + proj_bars, tp1, "TP1", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp2  := label.new(bar_index + proj_bars, tp2, "TP2", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp3  := label.new(bar_index + proj_bars, tp3, "TP3", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-
-    // Alerta JSON para el bot (arreglo 5, sin efecto visual)
-    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + '}', alert.freq_once_per_bar_close)
-
-if sell_trigger
-    f_limpiar_lineas()
-    entry = close
-    sl    = entry + sl_points
-    tp1   = entry - (sl_points * 1.0)
-    tp2   = entry - (sl_points * 2.0)
-    tp3   = entry - (sl_points * 3.0)
-
-    label.new(bar_index, high + (atr_val * 0.4), "SELL", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
-
-    l_entry := line.new(bar_index, entry, bar_index + proj_bars, entry, color=color.gray, width=1, style=line.style_dotted)
-    l_sl    := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
-    l_tp1   := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.teal, width=1)
-    l_tp2   := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.teal, width=2)
-    l_tp3   := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.teal, width=1)
-
-    lb_sl   := label.new(bar_index + proj_bars, sl, "SL: " + str.tostring(sl, "#"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp1  := label.new(bar_index + proj_bars, tp1, "TP1", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp2  := label.new(bar_index + proj_bars, tp2, "TP2", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    lb_tp3  := label.new(bar_index + proj_bars, tp3, "TP3", color=color.teal, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-
-    // Alerta JSON para el bot (arreglo 5, sin efecto visual)
-    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + '}', alert.freq_once_per_bar_close)
-
-// --- LÍNEA MORADA DE RETROCESO / GATILLO (BREAKER / RETEST LEVEL) ---
-if sell_trigger
-    // Se elimina la anterior para mantener el gráfico limpio
-    line.delete(ln_trigger_purple)
-    // Nivel morado: mínimo de la vela que confirma el quiebre o nivel de entrada exacto
-    purple_level = low[1]
-    ln_trigger_purple := line.new(bar_index, purple_level, bar_index + proj_bars, purple_level, color=color.rgb(155, 38, 206), width=2, style=line.style_solid)
-
-if buy_trigger
-    line.delete(ln_trigger_purple)
-    purple_level = high[1]
-    ln_trigger_purple := line.new(bar_index, purple_level, bar_index + proj_bars, purple_level, color=color.rgb(155, 38, 206), width=2, style=line.style_solid)
-
-// --- ZONAS DE INTERÉS (ORDER BLOCKS) CON MITIGACIÓN ---
-p_high = ta.pivothigh(high, left_bars, right_bars)
-p_low  = ta.pivotlow(low, left_bars, right_bars)
+// --- PIVOTES FRACTÁLICOS (SMC) & EQH/EQL ---
+p_hi = ta.pivothigh(high, left_bars, right_bars)
+p_lo = ta.pivotlow(low, left_bars, right_bars)
 
 var float last_ph = na
 var float last_pl = na
 
+if not na(p_hi)
+    last_ph := p_hi
+if not na(p_lo)
+    last_pl := p_lo
+
+// --- NIVELES STRONG / WEAK Y PREMIUM / DISCOUNT ---
+var line l_strong = na
+var line l_weak   = na
+var label lb_strong = na
+var label lb_weak   = na
+var label lb_prem = na
+var label lb_eq   = na
+var label lb_disc = na
+
+// --- ZONAS DE INTERÉS (OB) ---
 type OB
     box   b
     float top
@@ -193,39 +130,156 @@ type OB
 
 var OB[] obs = array.new<OB>()
 
-// Creación de Zona al haber quiebre de estructura (arreglo 1 y 3: SOLO vela
-// confirmada, pivotes/ATR existentes, zona en el lado correcto del precio y
-// left nunca negativo en las primeras velas).
+// Ruptura de estructura al haber quiebre (arreglo 1 y 3: SOLO vela confirmada,
+// pivotes/ATR existentes, zona en el lado correcto del precio y left nunca
+// negativo en las primeras velas).
 if barstate.isconfirmed
-    if not na(p_high)
-        last_ph := p_high
-    if not na(p_low)
-        last_pl := p_low
-
-    bool bos_up = not na(last_ph) and not na(last_pl) and not na(atr_val) and close > last_ph and close[1] <= last_ph and last_pl < close
-    bool bos_dn = not na(last_ph) and not na(last_pl) and not na(atr_val) and close < last_pl and close[1] >= last_pl and last_ph > close
+    bool bos_up   = not na(last_ph) and not na(last_pl) and not na(atr_val) and close > last_ph and close[1] <= last_ph and last_pl < close
+    bool bos_down = not na(last_ph) and not na(last_pl) and not na(atr_val) and close < last_pl and close[1] >= last_pl and last_ph > close
 
     if bos_up
-        box_buy = box.new(math.max(0, bar_index - right_bars - 5), last_pl, bar_index + 15, last_pl - (atr_val * 0.7), bgcolor=color.new(color.blue, 85), border_color=color.blue, text="ZONA DE COMPRA (OB)", text_size=size.tiny, text_color=color.blue)
-        array.push(obs, OB.new(box_buy, last_pl, last_pl - (atr_val * 0.7), true))
+        label.new(bar_index, high, "CHOCH", color=color.new(color.white, 100), textcolor=color.teal, style=label.style_label_down, size=size.tiny)
+        line.delete(l_strong)
+        label.delete(lb_strong)
+        line.delete(l_weak)
+        label.delete(lb_weak)
+
+        l_strong  := line.new(bar_index - right_bars, last_pl, bar_index + 20, last_pl, color=color.green, width=1)
+        lb_strong := label.new(bar_index + 20, last_pl, "Strong Low", color=color.new(color.white, 100), textcolor=color.green, style=label.style_label_left, size=size.tiny)
+
+        l_weak    := line.new(bar_index, high + (atr_val * 1.5), bar_index + 20, high + (atr_val * 1.5), color=color.red, width=1)
+        lb_weak   := label.new(bar_index + 20, high + (atr_val * 1.5), "Weak High", color=color.new(color.white, 100), textcolor=color.red, style=label.style_label_left, size=size.tiny)
+
+        // Premium / Equilibrium / Discount (arreglo 6: inline, se recrean en cada ruptura)
+        label.delete(lb_prem)
+        label.delete(lb_eq)
+        label.delete(lb_disc)
+        eq_val  = (high + (atr_val * 1.5) + last_pl) / 2
+        lb_prem := label.new(bar_index + 15, high + (atr_val * 1.5), "Premium", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+        lb_eq   := label.new(bar_index + 15, eq_val, "Equilibrium", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+        lb_disc := label.new(bar_index + 15, last_pl, "Discount", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+
+        box_buy = box.new(math.max(0, bar_index - right_bars - 4), last_pl, bar_index + 20, last_pl - (atr_val * 0.6),
+                          bgcolor=color.new(color.blue, 85), border_color=color.blue,
+                          text="ZONA DE COMPRA (OB)", text_size=size.tiny, text_color=color.blue)
+        array.push(obs, OB.new(box_buy, last_pl, last_pl - (atr_val * 0.6), true))
         last_ph := na
 
-    if bos_dn
-        box_sell = box.new(math.max(0, bar_index - right_bars - 5), last_ph + (atr_val * 0.7), bar_index + 15, last_ph, bgcolor=color.new(color.red, 85), border_color=color.red, text="ZONA DE VENTA (OB)", text_size=size.tiny, text_color=color.red)
-        array.push(obs, OB.new(box_sell, last_ph + (atr_val * 0.7), last_ph, false))
+    if bos_down
+        label.new(bar_index, low, "CHOCH", color=color.new(color.white, 100), textcolor=color.maroon, style=label.style_label_up, size=size.tiny)
+        line.delete(l_strong)
+        label.delete(lb_strong)
+        line.delete(l_weak)
+        label.delete(lb_weak)
+
+        l_strong  := line.new(bar_index - right_bars, last_ph, bar_index + 20, last_ph, color=color.maroon, width=1)
+        lb_strong := label.new(bar_index + 20, last_ph, "Strong High", color=color.new(color.white, 100), textcolor=color.maroon, style=label.style_label_left, size=size.tiny)
+
+        l_weak    := line.new(bar_index, low - (atr_val * 1.5), bar_index + 20, low - (atr_val * 1.5), color=color.teal, width=1)
+        lb_weak   := label.new(bar_index + 20, low - (atr_val * 1.5), "Weak Low", color=color.new(color.white, 100), textcolor=color.teal, style=label.style_label_left, size=size.tiny)
+
+        // Premium / Equilibrium / Discount (arreglo 6: inline, se recrean en cada ruptura)
+        label.delete(lb_prem)
+        label.delete(lb_eq)
+        label.delete(lb_disc)
+        eq_val  = (last_ph + (low - (atr_val * 1.5))) / 2
+        lb_prem := label.new(bar_index + 15, last_ph, "Premium", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+        lb_eq   := label.new(bar_index + 15, eq_val, "Equilibrium", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+        lb_disc := label.new(bar_index + 15, low - (atr_val * 1.5), "Discount", color=color.new(color.white, 100), textcolor=color.gray, size=size.tiny)
+
+        box_sell = box.new(math.max(0, bar_index - right_bars - 4), last_ph + (atr_val * 0.6), bar_index + 20, last_ph,
+                           bgcolor=color.new(color.red, 85), border_color=color.red,
+                           text="ZONA DE VENTA (OB)", text_size=size.tiny, text_color=color.red)
+        array.push(obs, OB.new(box_sell, last_ph + (atr_val * 0.6), last_ph, false))
         last_pl := na
 
-    // Mitigación y extensión de Zonas activas
+    // Mitigación de OBs (invasión total de la caja)
     if array.size(obs) > 0
         for i = array.size(obs) - 1 to 0
             o = array.get(obs, i)
-            // Si el precio mitiga la zona, se corta la proyección
-            mitigated = (o.bull and low < o.btm) or (not o.bull and high > o.top)
-            if mitigated
+            if (o.bull and low < o.btm) or (not o.bull and high > o.top)
                 box.set_right(o.b, bar_index)
                 array.remove(obs, i)
             else
                 box.set_right(o.b, bar_index + 10)
+
+// --- EJECUCIÓN (CON LÍNEA MORADA DE RETESTEO) ---
+var label lb_trade_main   = na
+var label lb_trade_sl     = na
+var label lb_tp1          = na
+var label lb_tp2          = na
+var label lb_tp3          = na
+var line  ln_tp1          = na
+var line  ln_tp2          = na
+var line  ln_tp3          = na
+var line  ln_sl           = na
+var line  ln_retest_purple = na
+
+f_limpiar_trade() =>
+    label.delete(lb_trade_main)
+    label.delete(lb_trade_sl)
+    label.delete(lb_tp1)
+    label.delete(lb_tp2)
+    label.delete(lb_tp3)
+    line.delete(ln_tp1)
+    line.delete(ln_tp2)
+    line.delete(ln_tp3)
+    line.delete(ln_sl)
+    line.delete(ln_retest_purple)
+
+if buy_trigger
+    f_limpiar_trade()
+    entry = close
+    sl    = entry - sl_points
+    tp1   = entry + (sl_points * 1.0)
+    tp2   = entry + (sl_points * 2.0)
+    tp3   = entry + (sl_points * 3.0)
+
+    lb_trade_main    := label.new(bar_index, low - (atr_val * 0.3), "COMPRA\n" + str.tostring(entry, "#.#"),
+                                  color=color.rgb(0, 168, 89), textcolor=color.white, style=label.style_label_up, size=size.normal)
+    ln_retest_purple := line.new(bar_index, high[1], bar_index + proj_bars, high[1], color=color.purple, width=2)
+    ln_sl            := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
+    lb_trade_sl      := label.new(bar_index, sl, "SL: " + str.tostring(sl, "#.#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    ln_tp1 := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.rgb(0, 200, 115), width=1)
+    lb_tp1 := label.new(bar_index + proj_bars, tp1, "TP1: " + str.tostring(tp1, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    ln_tp2 := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.rgb(0, 200, 115), width=1)
+    lb_tp2 := label.new(bar_index + proj_bars, tp2, "TP2: " + str.tostring(tp2, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    ln_tp3 := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.rgb(0, 200, 115), width=1)
+    lb_tp3 := label.new(bar_index + proj_bars, tp3, "TP3: " + str.tostring(tp3, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    // Alerta JSON para el bot (arreglo 5, sin efecto visual; JSON por
+    // concatenacion porque str.format interpreta las llaves como placeholders)
+    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + ',"tf":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+
+if sell_trigger
+    f_limpiar_trade()
+    entry = close
+    sl    = entry + sl_points
+    tp1   = entry - (sl_points * 1.0)
+    tp2   = entry - (sl_points * 2.0)
+    tp3   = entry - (sl_points * 3.0)
+
+    lb_trade_main    := label.new(bar_index, high + (atr_val * 0.3), "VENTA\n" + str.tostring(entry, "#.#"),
+                                  color=color.rgb(235, 47, 65), textcolor=color.white, style=label.style_label_down, size=size.normal)
+    ln_retest_purple := line.new(bar_index, low[1], bar_index + proj_bars, low[1], color=color.purple, width=2)
+    ln_sl            := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
+    lb_trade_sl      := label.new(bar_index, sl, "SL: " + str.tostring(sl, "#.#"), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    ln_tp1 := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.rgb(0, 200, 115), width=1)
+    lb_tp1 := label.new(bar_index + proj_bars, tp1, "TP1: " + str.tostring(tp1, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    ln_tp2 := line.new(bar_index, tp2, bar_index + proj_bars, tp2, color=color.rgb(0, 200, 115), width=1)
+    lb_tp2 := label.new(bar_index + proj_bars, tp2, "TP2: " + str.tostring(tp2, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    ln_tp3 := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.rgb(0, 200, 115), width=1)
+    lb_tp3 := label.new(bar_index + proj_bars, tp3, "TP3: " + str.tostring(tp3, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    // Alerta JSON para el bot (arreglo 5, sin efecto visual; JSON por
+    // concatenacion porque str.format interpreta las llaves como placeholders)
+    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + ',"tf":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
 
 // --- ALERTAS SIMPLES (alternativa sin JSON: condición por señal) ---
 alertcondition(buy_trigger, "ZARUS30 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
