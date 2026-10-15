@@ -9,6 +9,9 @@ data/
 *.db
 *.db-shm
 *.db-wal
+# (se-data-2) src/data/ es CÓDIGO TS del Strategy Engine (candle_provider),
+# no datos runtime — se re-incluye para que git no lo trague (último patrón gana)
+!src/data/
 
 # Environment variables & secrets
 .env

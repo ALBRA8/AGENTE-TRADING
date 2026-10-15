@@ -224,6 +224,20 @@ db.exec(`
   }
 })();
 
+// ── SE-DATA (se-data-2): strategy_context — registro OpenTrade (B11/R11.2) ──
+// Contexto completo del Strategy Engine (STRATEGY_ENGINE_V1 §2.2
+// openTradeContext: pilares, liquidez barrida, POI, trigger, retest, TFs)
+// persistido como JSON junto a la decisión. Migración IDEMPOTENTE siguiendo
+// el patrón exacto de migrateDecisionLog (pragma table_info + ALTER).
+(function migrateStrategyContext() {
+  const cols = (
+    db.pragma("table_info(decision_log)") as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (!cols.includes("strategy_context")) {
+    db.exec(`ALTER TABLE decision_log ADD COLUMN strategy_context TEXT`);
+  }
+})();
+
 // ── Migración trade_orders: verificación de ejecución + contrato §12 ──
 (function migrateTradeOrders() {
   const cols = (
@@ -463,6 +477,42 @@ export function updateDecisionOutcome(decisionId: number, pnl: number): void {
   db.prepare(
     `UPDATE decision_log SET outcome_pnl = ?, outcome_settled = 1, outcome_timestamp = datetime('now') WHERE id = ?`
   ).run(pnl, decisionId);
+}
+
+// ── SE-DATA (se-data-2): strategy_context — B11/R11.2 (STRATEGY_ENGINE_V1) ──
+/**
+ * Guarda el contexto OpenTrade del Strategy Engine como JSON en
+ * decision_log.strategy_context (R11.2). Fail-closed: exige JSON parseable
+ * y decisión EXISTENTE. Re-save = upsert (contexto enriquecido en S7→S8).
+ */
+export function saveStrategyContext(decisionId: number, contextJson: string): void {
+  try {
+    JSON.parse(contextJson); // valida ANTES de persistir (fail-closed)
+  } catch {
+    throw new Error(
+      `saveStrategyContext: contextJson no es JSON válido (decision ${decisionId})`
+    );
+  }
+  const res = db
+    .prepare(`UPDATE decision_log SET strategy_context = ? WHERE id = ?`)
+    .run(contextJson, decisionId);
+  if (res.changes === 0) {
+    throw new Error(
+      `saveStrategyContext: decision_log id=${decisionId} no existe`
+    );
+  }
+}
+
+/**
+ * Recupera el JSON de contexto OpenTrade de una decisión (R11.2/R11.3:
+ * al settlement se une al PnL para B18 y la memoria del agente).
+ * Null si la decisión no existe o aún no tiene contexto.
+ */
+export function getStrategyContext(decisionId: number): string | null {
+  const row = db
+    .prepare(`SELECT strategy_context FROM decision_log WHERE id = ?`)
+    .get(decisionId) as { strategy_context: string | null } | undefined;
+  return row?.strategy_context ?? null;
 }
 
 /**
