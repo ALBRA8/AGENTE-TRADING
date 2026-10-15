@@ -27,6 +27,11 @@ import { saveDecision } from "../database/sqlite.js";
 import { getAccountRisk } from "./risk_controls.js";
 import { MT5Bridge } from "../config/mt5bridge.js";
 import { assertExecutionForDecision, initialApprovalStatus } from "./policy.js";
+import {
+  getStrategyEngineMode, getSharedRunner, gatesToEngineFlags,
+  planFromSignal, persistStrategyContext, describeTick,
+  type StrategyTickResult,
+} from "../strategy/integration.js";
 
 // ── Tipos ───────────────────────────────────────────────────
 export type GateStatus = "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
@@ -526,12 +531,29 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
     // ── Etapa 0: higiene de pendientes + riesgo de cuenta (sin tokens) ──
     // La limpieza corre en paralelo con los filtros; su fallo jamás
     // interrumpe el pipeline (solo deja el log honesto).
+    // ── STRATEGY ENGINE V1.0 (spec §6/§7, mapa de integración §4) ─────
+    // El fetch multi-TF arranca ANTES de los analistas (paralelo, cero
+    // latencia añadida); la evaluación determinista S0-S9 ocurre al cierre
+    // de vela M1 con los flags derivados de los gates (news/account).
+    const engineMode = getStrategyEngineMode();
+    const engineFetchP = engineMode === "off" ? null : getSharedRunner().fetchMultiTF(symbol);
     const [{ gates, reports }, accountGate] = await Promise.all([
       stageAnalysts(symbol, timeframe, opts.onProgress),
       stageAccountRisk(),
     ]);
     gates.push(accountGate);
     void cleanupStalePendingOrders(opts.onProgress);
+
+    let engineTick: StrategyTickResult | null = null;
+    if (engineFetchP) {
+      try {
+        engineTick = getSharedRunner().evaluateTick(symbol, await engineFetchP, gatesToEngineFlags(gates));
+        opts.onProgress?.(describeTick(engineTick, engineMode));
+      } catch {
+        engineTick = null; // doble red de seguridad: el engine jamás tumba el pipeline
+      }
+    }
+
     const redGate = gates.find((g) => g.status === "RED");
 
     if (redGate) {
@@ -548,27 +570,54 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
         symbol, timeframe, finalAction: "ABORTED", gates, verdict: null, plan: null,
         opinions: [], abortReason: redGate.detail, latencyMs: Date.now() - t0, tokens: 0,
       });
+      if (engineTick) persistStrategyContext(decisionId, engineTick, engineMode); // B11 en el abort temprano
       return { symbol, timeframe, finalAction: "ABORTED", decisionId, markdown: md };
     }
 
-    // ── Etapa 2: debate ──
-    const debate = await stageDebate(symbol, reports, opts.onProgress);
-    tokens += debate.tokens;
+    // ── Etapa 2: debate (SALTADA en modo source con orden viva del engine) ──
+    // Modo FUENTE (mapa §4-A): el plan lo fabrica el engine determinista y el
+    // LLM queda fuera de la decisión (narra, nunca decide). El plan atraviesa
+    // el MISMO gate final en código, policy check, saveDecision y hard-gate.
+    const engineSignal = engineMode === "source" ? engineTick?.signal ?? null : null;
+    const enginePlan = engineSignal ? planFromSignal(engineSignal) : null;
 
-    // ── Etapa 3: manager ──
-    opts.onProgress?.(`🧭 Fase 3/6 · Research Manager sintetizando…`);
-    const mgr = await stageManager(symbol, reports, debate, tokens);
-    tokens += mgr.tokens;
-    const verdict = mgr.verdict;
+    let debate: Awaited<ReturnType<typeof stageDebate>> | null = null;
+    let verdict: ManagerVerdict | null = null;
+    let plan: TradePlan | null = null;
 
-    // ── Etapa 4: planner + lecciones ──
-    opts.onProgress?.(`📐 Fase 4/6 · Construyendo plan de trade (con lecciones aprendidas)…`);
-    const planner = await stagePlanner(symbol, timeframe, reports, verdict, tokens);
-    tokens += planner.tokens;
-    let plan = planner.plan;
+    if (enginePlan && engineSignal) {
+      opts.onProgress?.(
+        `🧠 Modo FUENTE: plan determinista del engine — LIMIT ${engineSignal.entry!.price} · SL ${engineSignal.sl!.pips.toFixed(1)} pips · RR ${engineSignal.tp!.rr.toFixed(2)} (LLM fuera de la decisión)`
+      );
+      plan = enginePlan;
+      verdict = {
+        bias: engineSignal.direction === "long" ? "BULLISH" : "BEARISH",
+        confidence: 1,
+        conditions: [],
+        rationale: "STRATEGY ENGINE V1.0 — setup determinista SMC (sin LLM decisor)",
+      };
+    } else {
+      debate = await stageDebate(symbol, reports, opts.onProgress);
+      tokens += debate.tokens;
+
+      // ── Etapa 3: manager ──
+      opts.onProgress?.(`🧭 Fase 3/6 · Research Manager sintetizando…`);
+      const mgr = await stageManager(symbol, reports, debate, tokens);
+      tokens += mgr.tokens;
+      verdict = mgr.verdict;
+
+      // ── Etapa 4: planner + lecciones ──
+      opts.onProgress?.(`📐 Fase 4/6 · Construyendo plan de trade (con lecciones aprendidas)…`);
+      const planner = await stagePlanner(symbol, timeframe, reports, verdict, tokens);
+      tokens += planner.tokens;
+      plan = planner.plan;
+    }
 
     // ── Etapa 5: trío de riesgo ──
-    const needRisk = plan?.action === "EXECUTE";
+    // En modo source el trío NO aplica: sus vetos serían decisión LLM sobre
+    // un plan determinista; el engine ya pasó sus propios gates B12/B13/B16
+    // y el plan atraviesa igualmente account_risk, policy y hard-gate.
+    const needRisk = plan?.action === "EXECUTE" && !enginePlan;
     let opinions: RiskOpinion[] = [];
     let vetoes = 0;
     if (needRisk) {
@@ -665,13 +714,14 @@ export async function runDecisionPipeline(opts: PipelineOptions): Promise<Pipeli
       confidence: verdict?.confidence ?? null,
       gatesJson: JSON.stringify(gates),
       reportsJson: JSON.stringify(reports).slice(0, 8_000),
-      debateJson: JSON.stringify({ bull: debate.bull, bear: debate.bear, risk: opinions }).slice(0, 8_000),
+      debateJson: JSON.stringify({ bull: debate?.bull ?? null, bear: debate?.bear ?? null, risk: opinions }).slice(0, 8_000),
       reasoning: abortReason ?? plan?.reasoning ?? undefined,
       tokensUsed: tokens,
       latencyMs,
       approvalStatus: approvalStatus ?? undefined,
       policyResult: policyResult ?? undefined,
     });
+    if (engineTick) persistStrategyContext(decisionId, engineTick, engineMode); // B11: contexto OpenTrade
 
     // ── Flip de bias: pendientes del agente en dirección opuesta al bias
     // decidido quedan anuladas (su EXECUTE original ya fue invalidado por

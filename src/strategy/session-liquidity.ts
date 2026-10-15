@@ -9,16 +9,27 @@ function etMinutes(t: number): number {
   const [h, m] = f.format(new Date(t)).split(':').map(Number);
   return (h % 24) * 60 + m;
 }
-function etDateKey(t: number): string {
+export function etDateKey(t: number): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: ET, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(t));
 }
-// convierte hora pared ET -> UTC ms con corrección de offset en 2 pasadas (DST-safe)
+// offset real (ms) de la zona ET en el instante t: zonedWall(asUTC) − t
+// (negativo al oeste de UTC; EDT=-4h, EST=-5h) — DST-safe por construcción
+function etOffsetMs(t: number): number {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: ET, hour12: false, year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const get = (type: string): number => Number(dtf.formatToParts(new Date(t)).find(p => p.type === type)!.value);
+  const asUTC = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+  return asUTC - Math.floor(t / 1000) * 1000;
+}
+// convierte hora pared ET (dateKey + minutos desde 00:00, tolera >24h)
+// a UTC ms: se lee la hora pared como si fuera UTC y se le resta el offset
+// real de ET en ese instante (UTC = pared − offset). Ventanas 03/08/12/19h
+// están lejos de la transición DST (02:00 ET) ⇒ una pasada es exacta.
 function etWallToUTC(dateKey: string, minutes: number): number {
-  const guess = Date.parse(`${dateKey}T00:00:00Z`) - 5 * 3600_000 + minutes * 60_000;
-  const off1 = Date.parse(`${dateKey}T00:00:00Z`) - Date.parse(new Intl.DateTimeFormat('en-CA', { timeZone: ET, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(guess)) + 'T00:00:00Z');
-  const corrected = guess + off1;
-  const off2 = Date.parse(`${dateKey}T00:00:00Z`) - Date.parse(new Intl.DateTimeFormat('en-CA', { timeZone: ET, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(corrected)) + 'T00:00:00Z');
-  return guess + off2;
+  const naive = Date.parse(`${dateKey}T00:00:00Z`) + minutes * 60_000;
+  return naive - etOffsetMs(naive);
 }
 
 export interface SessionWindow { startUTC: number; endUTC: number; name: 'LDN' | 'NY_KZ' | 'ASIA' }

@@ -22,6 +22,7 @@ import { settleDecisions } from "./tools/settle_decisions.js";
 import { evaluateBrainTool } from "./tools/evaluate_brain.js";
 import { agentStatusTool } from "./tools/agent_status.js";
 import { doctorStatusTool } from "./tools/doctor_status.js";
+import { runStrategyEngineTool } from "./tools/run_strategy_engine.js";
 import { captureAutoError } from "./self_improve.js";
 
 // ── Register all available tools ───────────────────────────
@@ -44,6 +45,7 @@ const TOOL_REGISTRY: Tool[] = [
  evaluateBrainTool,
  agentStatusTool,
  doctorStatusTool, // Task 10-c §20: doctor del agente (agrega checks existentes)
+ runStrategyEngineTool, // STRATEGY ENGINE V1.0: tick determinista S0-S9 (spec §6)
  // agrega más herramientas aquí conforme crece el agente
 ];
 
