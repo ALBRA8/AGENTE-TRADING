@@ -27,9 +27,10 @@ function assert(cond: boolean, msg: string) {
 }
 
 async function main() {
-  // Limpieza
+  // Limpieza (incluye tablas P0 EXECUTION TRUTH)
   db.exec(`DELETE FROM decision_log; DELETE FROM trade_orders; DELETE FROM agent_lessons;
-           DELETE FROM agent_errors; DELETE FROM trade_performance; DELETE FROM brain_evaluations;`);
+           DELETE FROM agent_errors; DELETE FROM trade_performance; DELETE FROM brain_evaluations;
+           DELETE FROM executions; DELETE FROM execution_deals; DELETE FROM execution_events;`);
 
   // ── 1. Hard-gate: decisión EXECUTE vigente ──
   const decId = saveDecision({
@@ -67,18 +68,51 @@ async function main() {
   // BACKDATE: simular que la decisión es de hace 2 días para que venza el horizonte
   db.prepare(`UPDATE decision_log SET created_at = datetime('now', '-2 days') WHERE id = ?`).run(decId);
 
-  // PnL reportado manualmente en trade_performance (posterior a la decisión)
+  // P0 EXECUTION TRUTH (§21): trade_performance + symbol + timestamp YA NO es
+  // autoridad de ejecución. Un log manual NO puede cerrar una decisión.
   db.prepare(
     `INSERT INTO trade_performance (timestamp, asset, setup_detected, nemotron_thought, result_pl)
      VALUES (datetime('now', '-1 day'), 'US30', 'ChoCh M1', 'test', 145.50)`
   ).run();
 
-  // ── 3. Settlement: debe cerrar con PnL 145.50 y source performance_log ──
+  // ── 3. Settlement P0: solo liquida una execution CLOSED + COMPLETE con
+  //      realized_pnl derivado de deals MT5 (lo que el reconciliador dejó
+  //      persistido en un ciclo anterior — bridge caído no hace falta).
+  const { createExecutionForDecision, attachExecutionOrderTicket } = await import("../src/execution/registry.js");
+  const { insertExecutionDeal, updateExecutionRow } = await import("../src/database/sqlite.js");
+  const exS = createExecutionForDecision({
+    decisionId: decId, symbol: "US30", direction: "long", orderType: "BUY_LIMIT",
+    requestedVolume: 0.33, requestedPrice: 44120, riskAmount: 50,
+  });
+  attachExecutionOrderTicket(exS.execution_id, 987654, "PENDING", "retcode 10008");
+  insertExecutionDeal({
+    executionId: exS.execution_id, dealTicket: 900001, orderTicket: 987654,
+    positionTicket: 876543, role: "entry", symbol: "US30", direction: "BUY",
+    volume: 0.33, price: 44120, profit: 0, commission: -2,
+    dealTime: new Date(Date.now() - 3600_000).toISOString(), timeMsc: 1,
+  });
+  insertExecutionDeal({
+    executionId: exS.execution_id, dealTicket: 900002, orderTicket: 987654,
+    positionTicket: 876543, role: "exit", symbol: "US30", direction: "SELL",
+    volume: 0.33, price: 44165, profit: 147.5, commission: 0,
+    dealReason: 5, closeCause: "TP_CLOSE",
+    dealTime: new Date(Date.now() - 60_000).toISOString(), timeMsc: 2,
+  });
+  updateExecutionRow(exS.execution_id, {
+    execution_status: "CLOSED", reconciliation_status: "COMPLETE",
+    executed_volume: 0.33, closed_volume: 0.33, realized_pnl: 145.5,
+    gross_pnl: 147.5, commission: -2, close_cause: "TP_CLOSE",
+    closed_at: new Date(Date.now() - 60_000).toISOString(),
+  });
   const summary = await runSettlement(10);
-  assert(summary.settled === 1, `settlement cierra 1 decisión con PnL real (got settled=${summary.settled})`);
+  assert(summary.settled === 1, `settlement cierra 1 decisión con PnL realizado de evidencia (got settled=${summary.settled})`);
   const settled = db.prepare(`SELECT outcome_pnl, outcome_settled, outcome_source FROM decision_log WHERE id = ?`).get(decId) as any;
-  assert(settled.outcome_pnl === 145.5 && settled.outcome_settled === 1 && settled.outcome_source === "performance_log",
-    `outcome persistido correctamente (pnl=${settled.outcome_pnl}, settled=${settled.outcome_settled}, source=${settled.outcome_source})`);
+  assert(settled.outcome_pnl === 145.5 && settled.outcome_settled === 1 && String(settled.outcome_source).startsWith("mt5_reconciled:"),
+    `outcome persistido desde ejecución reconciliada (pnl=${settled.outcome_pnl}, settled=${settled.outcome_settled}, source=${settled.outcome_source})`);
+  // El log manual de trade_performance quedó IGNORADO como autoridad (P0 §21):
+  // la fuente del outcome cita la execution reconciliada, no performance_log.
+  assert(!String(settled.outcome_source).includes("performance_log"),
+    `trade_performance ya no cierra decisiones (source=${settled.outcome_source})`);
 
   // ── 4. EXECUTE sin orden → tras max attempts expira como no_execution ──
   const dec2 = saveDecision({ symbol: "XAUUSD", finalAction: "EXECUTE", direction: "SELL", confidence: 0.7 });

@@ -260,6 +260,113 @@ db.exec(`
   }
 })();
 
+// ── P0 EXECUTION TRUTH: identidad de ejecución broker-independent ──
+// Genealogía: decision_id → execution_id → order_ticket → deal_tickets →
+// position_ticket → close_deal_tickets → realized outcome (docs/EXECUTION_TRUTH.md).
+// PRINCIPIOS (P0 §0-§6):
+//   - execution_id NUNCA deriva de tickets MT5 (uuid v4 interno, estable).
+//   - ORDER TICKET ≠ DEAL TICKET ≠ POSITION TICKET (columnas separadas;
+//     trade_orders.ticket legacy = ORDER ticket, solo compatibilidad).
+//   - Migración NO destructiva e idempotente (patrón pragma table_info).
+//   - 1 decision → 1 execution → 1 order → N entry deals → 1 position →
+//     N exit deals (NUNCA asumir 1:1:1:1).
+//   - idempotencia estructural: UNIQUE(order_ticket) en executions,
+//     UNIQUE(deal_ticket) en execution_deals → re-reconciliar no duplica.
+(function migrateExecutionTruth() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS executions (
+      execution_id           TEXT PRIMARY KEY,
+      decision_id            INTEGER,
+      correlation_id         TEXT,
+      parent_execution_id    TEXT,
+      symbol                 TEXT NOT NULL,
+      direction              TEXT NOT NULL,
+      order_type             TEXT,
+      requested_volume       REAL,
+      requested_price        REAL,
+      stop_loss              REAL,
+      take_profit            REAL,
+      risk_amount            REAL,
+      order_ticket           INTEGER,
+      position_ticket        INTEGER,
+      executed_volume        REAL,
+      closed_volume          REAL,
+      realized_pnl           REAL,
+      gross_pnl              REAL,
+      commission             REAL,
+      swap                   REAL,
+      fee                    REAL,
+      execution_status       TEXT NOT NULL DEFAULT 'UNKNOWN',
+      reconciliation_status  TEXT NOT NULL DEFAULT 'PENDING_RECONCILIATION',
+      close_cause            TEXT,
+      opened_at              TEXT,
+      closed_at              TEXT,
+      reconciled_at          TEXT,
+      recon_attempts         INTEGER NOT NULL DEFAULT 0,
+      last_recon_error       TEXT,
+      created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Un order_ticket = una execution (anti-duplicado tras respuesta ambigua)
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_order_ticket
+      ON executions(order_ticket) WHERE order_ticket IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_executions_decision ON executions(decision_id);
+    CREATE INDEX IF NOT EXISTS idx_executions_recon
+      ON executions(reconciliation_status, recon_attempts);
+
+    -- Evidencia de deals: UNA fila por deal real de MT5 (idempotente por UNIQUE)
+    CREATE TABLE IF NOT EXISTS execution_deals (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      execution_id     TEXT NOT NULL,
+      deal_ticket      INTEGER NOT NULL UNIQUE,
+      order_ticket     INTEGER,
+      position_ticket  INTEGER,
+      role             TEXT NOT NULL,
+      symbol           TEXT,
+      direction        TEXT,
+      volume           REAL,
+      price            REAL,
+      profit           REAL,
+      commission       REAL,
+      swap             REAL,
+      fee              REAL,
+      deal_entry       INTEGER,
+      deal_reason      INTEGER,
+      close_cause      TEXT,
+      deal_time        TEXT,
+      time_msc         INTEGER,
+      raw_json         TEXT,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_deals_exec ON execution_deals(execution_id);
+
+    -- Observabilidad P0 §37: eventos de ejecución (append-only, sin secretos)
+    CREATE TABLE IF NOT EXISTS execution_events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      execution_id  TEXT NOT NULL,
+      event         TEXT NOT NULL,
+      from_status   TEXT,
+      to_status     TEXT,
+      recon_status  TEXT,
+      reason        TEXT,
+      evidence_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_events ON execution_events(execution_id, id DESC);
+  `);
+
+  // trade_orders.execution_id: vínculo legacy (columna nueva, no destructiva).
+  // trade_orders.ticket sigue existiendo SOLO como compatibilidad y representa
+  // el ORDER TICKET de MT5 (documentado en docs/EXECUTION_TRUTH.md §6).
+  const cols = (
+    db.pragma("table_info(trade_orders)") as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (!cols.includes("execution_id")) {
+    db.exec(`ALTER TABLE trade_orders ADD COLUMN execution_id TEXT`);
+  }
+})();
+
 // ── Migración agent_lessons: campos MemoryDV (PROMPT 06 §9) ──
 // EPISODIC/SEMANTIC/PROCEDURAL/FACTUAL + evidencia + decay de utilidad.
 (function migrateAgentLessons() {
@@ -834,13 +941,15 @@ export function saveOrder(o: {
   strategy?: string | null;
   expiration?: number | null;
   verificationStatus?: string | null;
+  /** P0 Execution Truth: identidad interna de ejecución (uuid, no ticket) */
+  executionId?: string | null;
 }): number {
   const res = db
     .prepare(
       `INSERT INTO trade_orders
         (decision_id, symbol, direction, order_type, volume, entry_price, stop_loss, take_profit, ticket, risk_pct, status,
-         risk_amount, strategy, expiration, verification_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         risk_amount, strategy, expiration, verification_status, execution_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       o.decisionId ?? null,
@@ -857,7 +966,8 @@ export function saveOrder(o: {
       o.riskAmount ?? null,
       o.strategy ?? null,
       o.expiration ?? null,
-      o.verificationStatus ?? null
+      o.verificationStatus ?? null,
+      o.executionId ?? null
     );
   return Number(res.lastInsertRowid);
 }
@@ -868,7 +978,299 @@ export function getOrderByDecisionId(decisionId: number): TradeOrderRow | undefi
     .get(decisionId) as TradeOrderRow | undefined;
 }
 
+// ══ P0 EXECUTION TRUTH: helpers de identidad + evidencia + reconciliación ══
+// TODAS las escrituras son idempotentes por diseño:
+//   - createExecutionRow → INSERT OR IGNORE (execution_id PK)
+//   - insertExecutionDeal → INSERT OR IGNORE (deal_ticket UNIQUE)
+//   - updateExecutionRow → UPDATE por whitelist de columnas (recomputa, no acumula)
+
+export interface ExecutionRow {
+  execution_id: string;
+  decision_id: number | null;
+  correlation_id: string | null;
+  parent_execution_id: string | null;
+  symbol: string;
+  direction: string;
+  order_type: string | null;
+  requested_volume: number | null;
+  requested_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  risk_amount: number | null;
+  order_ticket: number | null;
+  position_ticket: number | null;
+  executed_volume: number | null;
+  closed_volume: number | null;
+  realized_pnl: number | null;
+  gross_pnl: number | null;
+  commission: number | null;
+  swap: number | null;
+  fee: number | null;
+  execution_status: string;
+  reconciliation_status: string;
+  close_cause: string | null;
+  opened_at: string | null;
+  closed_at: string | null;
+  reconciled_at: string | null;
+  recon_attempts: number;
+  last_recon_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExecutionDealRow {
+  id: number;
+  execution_id: string;
+  deal_ticket: number;
+  order_ticket: number | null;
+  position_ticket: number | null;
+  role: "entry" | "exit";
+  symbol: string | null;
+  direction: string | null;
+  volume: number | null;
+  price: number | null;
+  profit: number | null;
+  commission: number | null;
+  swap: number | null;
+  fee: number | null;
+  deal_entry: number | null;
+  deal_reason: number | null;
+  close_cause: string | null;
+  deal_time: string | null;
+  time_msc: number | null;
+  raw_json: string | null;
+  created_at: string;
+}
+
+const EXECUTION_PATCH_COLUMNS = new Set([
+  "decision_id", "correlation_id", "parent_execution_id", "symbol", "direction",
+  "order_type", "requested_volume", "requested_price", "stop_loss", "take_profit",
+  "risk_amount", "order_ticket", "position_ticket", "executed_volume", "closed_volume",
+  "realized_pnl", "gross_pnl", "commission", "swap", "fee", "execution_status",
+  "reconciliation_status", "close_cause", "opened_at", "closed_at", "reconciled_at",
+  "recon_attempts", "last_recon_error",
+]);
+
+/** Crea la execution (idempotente: INSERT OR IGNORE por PK execution_id). */
+export function createExecutionRow(e: {
+  executionId: string;
+  decisionId?: number | null;
+  correlationId?: string | null;
+  parentExecutionId?: string | null;
+  symbol: string;
+  direction: string;
+  orderType?: string | null;
+  requestedVolume?: number | null;
+  requestedPrice?: number | null;
+  stopLoss?: number | null;
+  takeProfit?: number | null;
+  riskAmount?: number | null;
+  executionStatus?: string;
+  reconciliationStatus?: string;
+}): string {
+  db.prepare(
+    `INSERT OR IGNORE INTO executions
+      (execution_id, decision_id, correlation_id, parent_execution_id, symbol, direction,
+       order_type, requested_volume, requested_price, stop_loss, take_profit, risk_amount,
+       execution_status, reconciliation_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    e.executionId,
+    e.decisionId ?? null,
+    e.correlationId ?? null,
+    e.parentExecutionId ?? null,
+    e.symbol,
+    e.direction,
+    e.orderType ?? null,
+    e.requestedVolume ?? null,
+    e.requestedPrice ?? null,
+    e.stopLoss ?? null,
+    e.takeProfit ?? null,
+    e.riskAmount ?? null,
+    e.executionStatus ?? "UNKNOWN",
+    e.reconciliationStatus ?? "PENDING_RECONCILIATION"
+  );
+  return e.executionId;
+}
+
+export function getExecutionRow(executionId: string): ExecutionRow | undefined {
+  return db.prepare(`SELECT * FROM executions WHERE execution_id = ?`).get(executionId) as
+    | ExecutionRow
+    | undefined;
+}
+
+export function getExecutionByOrderTicket(orderTicket: number): ExecutionRow | undefined {
+  return db.prepare(`SELECT * FROM executions WHERE order_ticket = ?`).get(orderTicket) as
+    | ExecutionRow
+    | undefined;
+}
+
+export function getExecutionByDecisionId(decisionId: number): ExecutionRow | undefined {
+  return db
+    .prepare(`SELECT * FROM executions WHERE decision_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1`)
+    .get(decisionId) as ExecutionRow | undefined;
+}
+
+/**
+ * UPDATE por whitelist (P0 §19: re-ejecutar produce el mismo estado —
+ * los campos se RECOMPUTAN desde evidencia, nunca se acumulan).
+ */
+export function updateExecutionRow(
+  executionId: string,
+  patch: Partial<Record<(typeof EXECUTION_PATCH_COLUMNS extends Set<infer K> ? K : never), unknown>>
+): void {
+  const entries = Object.entries(patch).filter(
+    ([k, v]) => EXECUTION_PATCH_COLUMNS.has(k) && v !== undefined
+  );
+  if (entries.length === 0) return;
+  const setSql = entries.map(([k]) => `${k} = ?`).join(", ");
+  db.prepare(
+    `UPDATE executions SET ${setSql}, updated_at = datetime('now') WHERE execution_id = ?`
+  ).run(...entries.map(([, v]) => v as unknown), executionId);
+}
+
+/**
+ * Inserta un deal de MT5 como evidencia (idempotente: UNIQUE deal_ticket).
+ * Devuelve true SOLO si la fila es nueva — permite detectar deals duplicados.
+ */
+export function insertExecutionDeal(d: {
+  executionId: string;
+  dealTicket: number;
+  orderTicket?: number | null;
+  positionTicket?: number | null;
+  role: "entry" | "exit";
+  symbol?: string | null;
+  direction?: string | null;
+  volume?: number | null;
+  price?: number | null;
+  profit?: number | null;
+  commission?: number | null;
+  swap?: number | null;
+  fee?: number | null;
+  dealEntry?: number | null;
+  dealReason?: number | null;
+  closeCause?: string | null;
+  dealTime?: string | null;
+  timeMsc?: number | null;
+  rawJson?: string | null;
+}): boolean {
+  const res = db
+    .prepare(
+      `INSERT OR IGNORE INTO execution_deals
+        (execution_id, deal_ticket, order_ticket, position_ticket, role, symbol, direction,
+         volume, price, profit, commission, swap, fee, deal_entry, deal_reason, close_cause,
+         deal_time, time_msc, raw_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      d.executionId, d.dealTicket, d.orderTicket ?? null, d.positionTicket ?? null,
+      d.role, d.symbol ?? null, d.direction ?? null, d.volume ?? null, d.price ?? null,
+      d.profit ?? null, d.commission ?? null, d.swap ?? null, d.fee ?? null,
+      d.dealEntry ?? null, d.dealReason ?? null, d.closeCause ?? null,
+      d.dealTime ?? null, d.timeMsc ?? null, d.rawJson ?? null
+    );
+  return res.changes === 1;
+}
+
+export function getExecutionDeals(executionId: string): ExecutionDealRow[] {
+  return db
+    .prepare(`SELECT * FROM execution_deals WHERE execution_id = ? ORDER BY time_msc ASC, deal_ticket ASC`)
+    .all(executionId) as ExecutionDealRow[];
+}
+
+/** Evento de observabilidad append-only (P0 §37). Sin secretos por contrato. */
+export function appendExecutionEvent(
+  executionId: string,
+  event: string,
+  opts?: {
+    fromStatus?: string | null;
+    toStatus?: string | null;
+    reconStatus?: string | null;
+    reason?: string | null;
+    evidenceJson?: string | null;
+  }
+): void {
+  db.prepare(
+    `INSERT INTO execution_events (execution_id, event, from_status, to_status, recon_status, reason, evidence_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    executionId, event,
+    opts?.fromStatus ?? null, opts?.toStatus ?? null, opts?.reconStatus ?? null,
+    opts?.reason ?? null, opts?.evidenceJson ?? null
+  );
+}
+
+export function getExecutionEvents(executionId: string): Array<{
+  id: number; created_at: string; execution_id: string; event: string;
+  from_status: string | null; to_status: string | null; recon_status: string | null;
+  reason: string | null; evidence_json: string | null;
+}> {
+  return db
+    .prepare(`SELECT * FROM execution_events WHERE execution_id = ? ORDER BY id ASC`)
+    .all(executionId) as Array<{
+      id: number; created_at: string; execution_id: string; event: string;
+      from_status: string | null; to_status: string | null; recon_status: string | null;
+      reason: string | null; evidence_json: string | null;
+    }>;
+}
+
+/**
+ * Ejecuciones que exigen reconciliación: PENDING_RECONCILIATION (incluye
+ * UNKNOWN) con techo de intentos para no martillar un bridge muerto.
+ */
+export function getExecutionsPendingReconciliation(limit = 10): ExecutionRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM executions
+       WHERE reconciliation_status = 'PENDING_RECONCILIATION'
+         AND recon_attempts < 12
+       ORDER BY recon_attempts ASC, updated_at ASC
+       LIMIT ?`
+    )
+    .all(limit) as ExecutionRow[];
+}
+
+export function bumpReconAttempts(executionId: string, error: string): void {
+  db.prepare(
+    `UPDATE executions
+     SET recon_attempts = recon_attempts + 1, last_recon_error = ?, updated_at = datetime('now')
+     WHERE execution_id = ?`
+  ).run(error.slice(0, 500), executionId);
+}
+
+export interface SettleableExecutionRow extends ExecutionRow {
+  d_id: number;
+  d_symbol: string;
+  d_direction: string | null;
+  d_confidence: number | null;
+}
+
+/**
+ * Decisiones EXECUTE sin cerrar cuya ejecución ya es CLOSED + COMPLETE con
+ * PnL realizado — ÚNICO camino hacia el aprendizaje (P0 §21/§22/§35).
+ */
+export function getSettleableReconciledExecutions(limit = 10): SettleableExecutionRow[] {
+  return db
+    .prepare(
+      `SELECT e.*, d.id AS d_id, d.symbol AS d_symbol, d.direction AS d_direction, d.confidence AS d_confidence
+       FROM executions e
+       JOIN decision_log d ON d.id = e.decision_id
+       WHERE d.final_action = 'EXECUTE'
+         AND d.outcome_settled = 0
+         AND e.execution_status = 'CLOSED'
+         AND e.reconciliation_status = 'COMPLETE'
+         AND e.realized_pnl IS NOT NULL
+       ORDER BY d.id ASC
+       LIMIT ?`
+    )
+    .all(limit) as SettleableExecutionRow[];
+}
+
 // ── Settlement helpers (Fase 2: cierre de decisiones) ───────
+// P0 §21: la autoridad de ejecución ya NO es trade_performance+symbol+timestamp;
+// es executions + execution_deals reconstruidos por ExecutionReconciler.
+// trade_performance se conserva para otras funciones (trackrecord, log manual)
+// pero settlement jamás derivará de ahí un outcome de ejecución MT5.
 
 /**
  * Decisiones EXECUTE cuyo horizonte ya venció y siguen sin outcome.

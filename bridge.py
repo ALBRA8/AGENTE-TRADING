@@ -536,6 +536,211 @@ def get_pending_orders():
     return jsonify({"orders": result, "count": len(result)})
 
 
+# ══════════════════════════════════════════════════════════════
+# P0 EXECUTION TRUTH — HISTORIAL MT5 (reconstrucción de ejecuciones)
+# ══════════════════════════════════════════════════════════════
+# La verdad de ejecución vive en la HISTORIA de MT5:
+#   ORDER  = intención/orden del broker   (history_orders_get)
+#   DEAL   = evidencia central de ejecución (history_deals_get)
+#   POSITION = estado agregado (position_id == ticket de posición;
+#              NUNCA asumir order_ticket == position_ticket)
+# Solo se exponen campos REALES de la API de MetaTrader5 — nada inventado.
+
+ORDER_STATE_NAMES = {
+    0: "STARTED", 1: "PLACED", 2: "CANCELED", 3: "PARTIAL",
+    4: "FILLED", 5: "REJECTED", 6: "EXPIRED", 7: "CALCULATED", 8: "MODIFY",
+}
+
+DEAL_ENTRY_NAMES = {0: "IN", 1: "OUT", 2: "INOUT", 3: "OUT_BY"}
+
+DEAL_REASON_NAMES = {
+    0: "CLIENT", 1: "MOBILE", 2: "WEB", 3: "EXPERT", 4: "SL", 5: "TP",
+    6: "SO", 7: "ROLLOVER", 8: "VMARGIN", 9: "SPLIT",
+}
+
+DEAL_TYPE_NAMES = {0: "BUY", 1: "SELL"}
+
+
+def _iso_epoch(ts: float) -> str:
+    return datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+
+def _serialize_history_order(o) -> dict:
+    return {
+        "ticket":        o.ticket,
+        "time":          _iso_epoch(o.time),
+        "timeEpoch":     int(o.time),
+        "timeMsc":       int(getattr(o, "time_msc", 0) or 0),
+        "type":          DEAL_TYPE_NAMES.get(o.type, str(o.type)),
+        "volumeInitial": float(o.volume_initial),
+        "volumeCurrent": float(o.volume_current),
+        "priceOpen":     float(o.price_open),
+        "priceCurrent":  float(o.price_current),
+        "sl":            float(o.sl),
+        "tp":            float(o.tp),
+        "state":         int(o.state),
+        "stateName":     ORDER_STATE_NAMES.get(o.state, str(o.state)),
+        "comment":       o.comment,
+        "positionId":    int(getattr(o, "position_id", 0) or 0),
+        "magic":         int(getattr(o, "magic", 0) or 0),
+        "retcode":       int(getattr(o, "retcode", 0) or 0),
+        "symbol":        o.symbol,
+    }
+
+
+def _serialize_history_deal(d) -> dict:
+    return {
+        "ticket":        d.ticket,
+        "order":         int(getattr(d, "order", 0) or 0),
+        "time":          _iso_epoch(d.time),
+        "timeEpoch":     int(d.time),
+        "timeMsc":       int(getattr(d, "time_msc", 0) or 0),
+        "type":          DEAL_TYPE_NAMES.get(d.type, str(d.type)),
+        "entry":         int(d.entry),
+        "entryName":     DEAL_ENTRY_NAMES.get(d.entry, str(d.entry)),
+        "volume":        float(d.volume),
+        "price":         float(d.price),
+        "profit":        float(d.profit),
+        "commission":    float(getattr(d, "commission", 0.0) or 0.0),
+        "swap":          float(getattr(d, "swap", 0.0) or 0.0),
+        "fee":           float(getattr(d, "fee", 0.0) or 0.0),
+        "symbol":        d.symbol,
+        "comment":       d.comment,
+        "positionId":    int(getattr(d, "position_id", 0) or 0),
+        "magic":         int(getattr(d, "magic", 0) or 0),
+        "reason":        int(getattr(d, "reason", 0) or 0),
+        "reasonName":    DEAL_REASON_NAMES.get(getattr(d, "reason", 0), str(getattr(d, "reason", 0))),
+    }
+
+
+def _parse_epoch_arg(name: str, default):
+    """Parsea un epoch en SEGUNDOS desde querystring. Devuelve (valor, error_json|None)."""
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default, None
+    try:
+        value = int(float(raw))
+        if value < 0:
+            raise ValueError
+        return datetime.utcfromtimestamp(value), None
+    except (TypeError, ValueError):
+        return None, (jsonify({"error": f"Parámetro '{name}' inválido: {raw!r} (se espera epoch en segundos)"}), 400)
+
+
+def _history_window(default_days: float = 7.0):
+    """Ventana temporal por defecto: últimos N días (UTC, como espera la API)."""
+    import time as _time
+    now = _time.time()
+    frm, err = _parse_epoch_arg("from", now - default_days * 86400)
+    if err:
+        return None, None, err
+    to, err = _parse_epoch_arg("to", now + 60)
+    if err:
+        return None, None, err
+    return frm, to, None
+
+
+@app.route("/history/orders", methods=["GET"])
+def get_history_orders():
+    """
+    Historia de ÓRDENES (intención del broker). APIs reales:
+      mt5.history_orders_get(date_from, date_to) — ventana temporal
+      mt5.history_orders_get(ticket=X)           — orden concreta
+      mt5.history_orders_get(position=X)         — órdenes de una posición
+    Query: ?from=<epoch s>&to=<epoch s>&ticket=<int>&position=<int>
+    """
+    denied = check_bridge_token()
+    if denied:
+        return denied
+
+    ticket = request.args.get("ticket", type=int)
+    position = request.args.get("position", type=int)
+
+    try:
+        if ticket is not None:
+            orders = mt5.history_orders_get(ticket=ticket)
+        elif position is not None:
+            orders = mt5.history_orders_get(position=position)
+        else:
+            date_from, date_to, err = _history_window()
+            if err:
+                return err
+            orders = mt5.history_orders_get(date_from, date_to)
+    except Exception as exc:  # noqa: BLE001 — el bridge nunca tumba al cliente
+        return jsonify({"error": "history_orders_get falló", "detail": str(exc)}), 500
+
+    if orders is None:
+        # None = sin datos / rango sin órdenes: respuesta honesta vacía
+        return jsonify({"orders": [], "count": 0, "detail": str(mt5.last_error())})
+
+    return jsonify({"orders": [_serialize_history_order(o) for o in orders], "count": len(orders)})
+
+
+@app.route("/history/deals", methods=["GET"])
+def get_history_deals():
+    """
+    Historia de DEALS (evidencia central de ejecución). APIs reales:
+      mt5.history_deals_get(date_from, date_to) — ventana temporal
+      mt5.history_deals_get(position=X)         — deals de una posición
+      mt5.history_deals_get(ticket=X)           — deal concreto
+    Query: ?from=<epoch s>&to=<epoch s>&position=<int>&ticket=<int>
+    """
+    denied = check_bridge_token()
+    if denied:
+        return denied
+
+    ticket = request.args.get("ticket", type=int)
+    position = request.args.get("position", type=int)
+
+    try:
+        if ticket is not None:
+            deals = mt5.history_deals_get(ticket=ticket)
+        elif position is not None:
+            deals = mt5.history_deals_get(position=position)
+        else:
+            date_from, date_to, err = _history_window()
+            if err:
+                return err
+            deals = mt5.history_deals_get(date_from, date_to)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": "history_deals_get falló", "detail": str(exc)}), 500
+
+    if deals is None:
+        return jsonify({"deals": [], "count": 0, "detail": str(mt5.last_error())})
+
+    return jsonify({"deals": [_serialize_history_deal(d) for d in deals], "count": len(deals)})
+
+
+@app.route("/history/position/<int:ticket>", methods=["GET"])
+def get_history_position(ticket: int):
+    """
+    Reconstruye UNA posición cerrada desde evidencia:
+      deals = history_deals_get(position=ticket)  (entry + exit deals, con
+              profit/commission/swap/fee y reason de cierre)
+      orders = history_orders_get(position=ticket)
+    El ticket aquí es el POSITION TICKET (position_id), que NO es el order
+    ticket ni un deal ticket (ver docs/EXECUTION_TRUTH.md).
+    """
+    denied = check_bridge_token()
+    if denied:
+        return denied
+
+    try:
+        deals = mt5.history_deals_get(position=ticket)
+        orders = mt5.history_orders_get(position=ticket)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": "history de posición falló", "detail": str(exc)}), 500
+
+    if (deals is None or len(deals) == 0) and (orders is None or len(orders) == 0):
+        return jsonify({"error": f"Posición {ticket} sin evidencia en la historia de MT5"}), 404
+
+    return jsonify({
+        "position_ticket": ticket,
+        "deals":  [_serialize_history_deal(d) for d in (deals or [])],
+        "orders": [_serialize_history_order(o) for o in (orders or [])],
+    })
+
+
 @app.route("/cancel/<int:ticket>", methods=["DELETE"])
 def cancel_order(ticket: int):
     """Cancela una orden pendiente por ticket."""
@@ -569,6 +774,9 @@ if __name__ == "__main__":
     log.info("  GET  /candles/<symbol>/<timeframe>/<count>")
     log.info("  GET  /positions")
     log.info("  GET  /orders")
+    log.info("  GET  /history/orders?from=&to=&ticket=&position=")
+    log.info("  GET  /history/deals?from=&to=&position=&ticket=")
+    log.info("  GET  /history/position/<ticket>")
     log.info("  POST /order")
     log.info("  POST /modify_position")
     log.info("  DELETE /cancel/<ticket>")

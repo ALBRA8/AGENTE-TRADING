@@ -8,6 +8,15 @@ import {
   saveOrder,
 } from "../../database/sqlite.js";
 import { assertExecutionForDecision } from "../policy.js";
+import {
+  attachExecutionOrderTicket,
+  createExecutionForDecision,
+  markExecutionCancelledBeforeSend,
+  markExecutionRejected,
+  markExecutionUnknown,
+  scheduleReconciliation,
+} from "../../execution/registry.js";
+import { reconcileExecution } from "../../execution/reconciler.js";
 
 /**
  * Herramienta de ejecución de órdenes via MT5 local (sin MetaApi)
@@ -483,6 +492,27 @@ export const executeTradeMT5: Tool = {
       // 9. Enviar orden al bridge con CONTEXTO de aprobación (§5/§13):
       //    el EXECUTION GUARD dentro de placeOrder re-valida TODO en el
       //    punto de envío (kill switch, riesgo de cuenta, spread, dedup…).
+      //
+      //    P0 EXECUTION TRUTH (§3/§12): la execution NACE ANTES del envío
+      //    (identidad pre-send en SQLite): si la respuesta se pierde o el
+      //    proceso muere, el reconciliador reconstruye qué ocurrió desde
+      //    MT5. La clasificación del fallo es CLASIFICABLE:
+      //      guard / HTTP 4xx  → rechazo claro (REJECTED / CANCELLED)
+      //      timeout / 5xx / transporte → UNKNOWN + reconciliación (§12)
+      //    NUNCA se reintenta una orden con resultado ambiguo.
+      const execution = createExecutionForDecision({
+        decisionId: gatedDecisionId ?? null,
+        correlationId: gatedDecisionId != null ? `decision:${gatedDecisionId}` : null,
+        symbol,
+        direction,
+        orderType,
+        requestedVolume: lotSize,
+        requestedPrice: entryPrice,
+        stopLoss: stopLossPrice,
+        takeProfit: takeProfitPrice,
+        riskAmount: realRisk,
+      });
+
       let result;
       try {
         result = await MT5Bridge.placeOrder(orderPayload, {
@@ -491,33 +521,56 @@ export const executeTradeMT5: Tool = {
         });
       } catch (orderErr) {
         const err = orderErr as Error & { code?: string };
-        if (err.code === "BRIDGE_TIMEOUT") {
-          // §13: estado DESCONOCIDO — la orden pudo haber llegado a MT5.
-          // NO se libera la decisión (evita duplicar la orden en un retry):
-          // queda consumida y la orden se registra como 'unknown'.
-          try {
-            saveOrder({
-              decisionId: gatedDecisionId,
-              symbol, direction, orderType,
-              volume: lotSize, entryPrice, stopLoss: stopLossPrice, takeProfit: takeProfitPrice,
-              riskPct: boundRiskPct,
-              status: "unknown",
-              verificationStatus: "unknown",
-            });
-          } catch {}
-          return `⚠️ **Timeout del bridge tras enviar la orden: estado DESCONOCIDO.**\nLa decisión #${gatedDecisionId} queda CONSUMIDA (no se libera) para evitar duplicar la orden. Verifica en MT5 si la orden existe antes de reintentar nada.`;
-        }
+        const httpStatus = /^MT5 Bridge error (\d{3}):/.exec(err.message ?? "");
+        const httpCode = httpStatus ? parseInt(httpStatus[1], 10) : null;
+
         if (err.code === "GUARD_REJECTED") {
           // El guard rechazó ANTES de enviar: no hay orden en MT5 → liberar.
+          markExecutionCancelledBeforeSend(execution.execution_id, `guard_rejected: ${err.message.slice(0, 200)}`);
           if (gatedDecisionId) releaseDecision(gatedDecisionId);
           return `🛑 **EXECUTION GUARD RECHAZÓ LA ORDEN (sin envío):**\n${err.message}\n\n_La decisión #${gatedDecisionId} fue liberada._`;
         }
-        if (gatedDecisionId) releaseDecision(gatedDecisionId);
-        throw orderErr;
+
+        if (httpCode !== null && httpCode >= 400 && httpCode < 500) {
+          // Rechazo CLARO del broker (el bridge respondió con retcode/4xx).
+          markExecutionRejected(execution.execution_id, `broker_rejected: ${err.message.slice(0, 200)}`);
+          if (gatedDecisionId) releaseDecision(gatedDecisionId);
+          return `❌ **Orden RECHAZADA por MT5 (evidencia clara, sin ambigüedad):**\n${err.message}\n\n_La decisión #${gatedDecisionId} fue liberada._`;
+        }
+
+        // ── P0 §12 CASO CRÍTICO: resultado AMBIGUO (timeout, 5xx, transporte) ──
+        // La orden PUDO llegar a MT5. Fail-closed: UNKNOWN + reconciliación.
+        // NO se libera la decisión (evita duplicar la orden en un retry) y
+        // NUNCA se reenvía automáticamente. El reconciliador consulta
+        // /history/orders + /history/deals + /positions y reconstruye.
+        markExecutionUnknown(execution.execution_id, `${err.code ?? "unknown_error"}: ${err.message.slice(0, 200)}`);
+        try {
+          saveOrder({
+            decisionId: gatedDecisionId,
+            symbol, direction, orderType,
+            volume: lotSize, entryPrice, stopLoss: stopLossPrice, takeProfit: takeProfitPrice,
+            riskPct: boundRiskPct,
+            riskAmount: realRisk,
+            status: "unknown",
+            verificationStatus: "unknown",
+            executionId: execution.execution_id,
+          });
+        } catch {}
+        scheduleReconciliation(execution.execution_id, reconcileExecution, 15_000);
+        return `⚠️ **Resultado AMBIGUO del envío (${err.code ?? "transporte"}): estado DESCONOCIDO por diseño (P0 §12).**\nLa decisión #${gatedDecisionId} queda CONSUMIDA (no se libera) y NO se reenvía nada: una orden ambigua jamás se reintenta a ciegas.\nExecution ID: ${execution.execution_id} → el reconciliador consultará la historia de MT5 y reconstruirá qué ocurrió realmente.`;
       }
 
+      // 10a. Adjuntar el ORDER TICKET a la execution (≠ position ≠ deal).
+      //      retcode 10008 = PLACED (pendiente), 10009 = DONE (llenada ya).
+      attachExecutionOrderTicket(
+        execution.execution_id,
+        result.ticket,
+        Number(result.retcode) === 10009 ? "FILLED" : "PENDING",
+        `retcode ${result.retcode} (verification ${result.verification})`
+      );
+
       // 10. Registrar la orden para el settlement (vínculo decisión ↔ orden)
-      //     con verificación request-vs-actual (§13).
+      //     con verificación request-vs-actual (§13) y execution_id (P0 §3).
       try {
         saveOrder({
           decisionId: gatedDecisionId,
@@ -535,6 +588,7 @@ export const executeTradeMT5: Tool = {
           expiration: expirationEpoch ?? null,
           verificationStatus: result.verification,
           status: "placed",
+          executionId: execution.execution_id,
         });
       } catch (dbErr) {
         // La orden ya salió: el fallo de telemetría no debe engañar al usuario
@@ -557,7 +611,8 @@ export const executeTradeMT5: Tool = {
 | **Take Profit** | ${takeProfitPrice} (1:3 RR) |
 | **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |
 | **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |
-| **Ticket MT5** | #${result.ticket} |
+| **Execution ID** | ${execution.execution_id} |
+| **Ticket MT5** | #${result.ticket} (ORDER) |
 | **Verificación §13** | ${result.verification === "verified" ? "✅ verified (retcode/precio/volumen concilian)" : "⚠️ divergence — revisar en MT5"} |
 | **Servidor** | ${account.server} |
       `.trim();

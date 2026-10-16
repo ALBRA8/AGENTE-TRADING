@@ -11,7 +11,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe') && tsx tests/position_management.test.ts && tsx tests/strategy_engine.test.ts && tsx tests/candle_provider.test.ts && tsx tests/strategy_context_db.test.ts && tsx tests/strategy_wiring.test.ts && npm run test:e2e",
+    "test": "tsx tests/smoke_phases.ts && ([ -f tests/risk_smc.test.ts ] && tsx tests/risk_smc.test.ts || echo 'skip: risk_smc.test.ts aún no existe') && tsx tests/position_management.test.ts && tsx tests/strategy_engine.test.ts && tsx tests/candle_provider.test.ts && tsx tests/strategy_context_db.test.ts && tsx tests/execution_truth.test.ts && tsx tests/strategy_wiring.test.ts && npm run test:e2e",
     "test:e2e": "tsx tests/e2e_pipeline.ts"
   },
   "dependencies": {

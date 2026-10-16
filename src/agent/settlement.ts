@@ -1,33 +1,42 @@
 // ============================================================
-// src/agent/settlement.ts
-// Fase 2 – Settlement automático (patrón TradingAgents):
+// src/agent/settlement.ts — P0 EXECUTION TRUTH (§21)
+// Settlement ya NO interpreta MT5: es una capa de MANTENIMIENTO y
+// ORQUESTACIÓN. La verdad de ejecución la reconstruye el
+// ExecutionReconciler (src/execution/reconciler.ts) desde la historia
+// real de MT5 (deals como evidencia central).
 //
-//   Cada decisión EXECUTE queda "abierta" hasta que su horizonte
-//   vence (default 24h). Entonces este módulo:
-//     1. Busca la orden real vinculada (trade_orders).
-//     2. Intenta obtener el resultado con la evidencia disponible:
-//        a. log manual del usuario (trade_performance) → fuente fiable
-//        b. posición viva en MT5 (profit flotante) → estimación provisional
-//        c. posición cerrada sin datos → hueco de telemetría (expired)
-//     3. Con resultado real → llama a la reflexión (self_improve) para
-//        destilar una lección y reforzar/contradecir lecciones previas.
-//     4. Persistencia: outcome_pnl, outcome_settled, outcome_source.
+// FASES:
+//   A. RECONCILIAR: ejecuciones UNKNOWN/PENDING_RECONCILIATION → reconciler
+//      (bridge caído ⇒ quedan UNKNOWN, jamás se inventa un resultado §18).
+//   B. LIQUIDAR desde evidencia: decisiones EXECUTE cuya ejecución está
+//      CLOSED + COMPLETE con realized_pnl derivado de deals reales
+//      (profit+commission+swap+fee). ÚNICO camino al aprendizaje (§22/§35).
+//   C. LEGADO: decisiones sin execution (pre-P0) — expiración honesta
+//      (hueco de telemetría, nunca pérdida) y flotante como observación
+//      provisional que NUNCA settlea ni genera lección (§16).
 //
-//   Estados de outcome_settled:
-//     0 = pendiente · 1 = settled con PnL · 2 = expirada sin datos
+// ELIMINADO (§21): trade_performance + symbol + timestamp como autoridad
+// de ejecución. trade_performance se conserva para otras funciones.
 //
-//   El bucle corre en background (startAgentMaintenance) y nunca
-//   lanza: un fallo de settlement jamás rompe el trading.
+// Estados de outcome_settled:
+//   0 = pendiente · 1 = settled con PnL REALIZADO reconciliado
+//   2 = expirada sin datos (hueco de telemetría, no es pérdida)
+//
+// El bucle corre en background (startAgentMaintenance) y nunca lanza.
 // ============================================================
 
 import db, {
   getUnsettledExecuteDecisions,
   getOrderByDecisionId,
+  getExecutionByDecisionId,
+  getSettleableReconciledExecutions,
   updateDecisionOutcome,
   bumpSettleAttempts,
   markDecisionExpired,
+  type SettleableExecutionRow,
 } from "../database/sqlite.js";
 import { MT5Bridge } from "../config/mt5bridge.js";
+import { reconcilePendingExecutions } from "../execution/reconciler.js";
 import { reflectOnExperience } from "./self_improve.js";
 import { consolidateMemory, type ConsolidationSummary } from "./consolidation.js";
 
@@ -38,19 +47,28 @@ const HORIZON_HOURS = Math.max(
 const MAX_ATTEMPTS = 8;
 
 export interface SettlementSummary {
-  settled: number; // con PnL real
-  estimated: number; // profit flotante (provisional)
-  expired: number; // sin datos
+  reconciled: number; // ejecuciones examinadas por el reconciliador
+  resolved: number; // ejecuciones que cambiaron de estado con evidencia
+  settled: number; // decisiones cerradas con PnL REALIZADO (deals MT5)
+  estimated: number; // flotante provisional (observación, NUNCA settlea)
+  expired: number; // huecos de telemetría (no son pérdidas)
   details: string[];
 }
 
 /**
- * Procesa un lote de decisiones EXECUTE vencidas.
- * Diseñado para ser tolerante a fallos: cada decisión se procesa
- * en su propio try/catch.
+ * Procesa un lote de mantenimiento: reconcilia ejecuciones pendientes y
+ * liquida decisiones cuya evidencia ya es CLOSED + COMPLETE.
+ * Tolerante a fallos: cada decisión se procesa en su propio try/catch.
  */
 export async function runSettlement(limit = 10): Promise<SettlementSummary> {
-  const summary: SettlementSummary = { settled: 0, estimated: 0, expired: 0, details: [] };
+  const summary: SettlementSummary = {
+    reconciled: 0,
+    resolved: 0,
+    settled: 0,
+    estimated: 0,
+    expired: 0,
+    details: [],
+  };
 
   // Lock de concurrencia: el bucle, el endpoint /api/agent/settle y el tool
   // settleDecisions comparten este flag para no duplicar lecciones.
@@ -63,8 +81,6 @@ export async function runSettlement(limit = 10): Promise<SettlementSummary> {
   try {
     const result = await runSettlementInner(limit, summary);
     // ── Task 10-c §3: consolidación de memoria DENTRO del mismo lock ──
-    // Tras cerrar outcomes corremos el pipeline EVENT→…→PROMOTION. Un fallo
-    // de consolidación jamás tumba el settlement (log honesto, sin relanzar).
     try {
       const cons = consolidateMemory();
       maintenanceState.lastConsolidationAt = new Date().toISOString();
@@ -80,17 +96,115 @@ export async function runSettlement(limit = 10): Promise<SettlementSummary> {
 
 async function runSettlementInner(limit: number, summary: SettlementSummary): Promise<SettlementSummary> {
 
+  // ── FASE A: RECONCILIAR ejecuciones pendientes (única interpretación MT5) ──
+  const bridgeAlive = await MT5Bridge.health().catch(() => false);
+  if (bridgeAlive) {
+    try {
+      const recon = await reconcilePendingExecutions(limit);
+      summary.reconciled = recon.reconciled;
+      summary.resolved = recon.resolved;
+      summary.details.push(...recon.details);
+    } catch (err) {
+      summary.details.push(`Reconciliación falló (no crítico): ${(err as Error).message}`);
+    }
+  } else {
+    // §18: bridge caído ⇒ ejecuciones siguen UNKNOWN/PENDING — sin datos
+    // falsos. La reconciliación se reintentará en el próximo ciclo.
+    summary.details.push("Bridge MT5 caído: reconciliación diferida (estados UNKNOWN intactos)");
+  }
+
+  // ── FASE B: LIQUIDAR desde ejecuciones CLOSED + COMPLETE (P0 §21/§22) ──
+  await settleFromReconciledExecutions(limit, summary);
+
+  // ── FASE C: decisiones legadas sin execution (pre-P0) ──
+  await handleLegacyDecisions(limit, bridgeAlive, summary);
+
+  return summary;
+}
+
+// ── FASE B ──────────────────────────────────────────────────
+
+/**
+ * ÚNICO camino de liquidación LIVE: ejecución CLOSED + reconciliation
+ * COMPLETE + realized_pnl derivado de deals reales. La idempotencia la
+ * garantiza outcome_settled=0 en el SELECT (una vez settled, no vuelve).
+ */
+async function settleFromReconciledExecutions(limit: number, summary: SettlementSummary): Promise<void> {
+  let rows: SettleableExecutionRow[];
+  try {
+    rows = getSettleableReconciledExecutions(limit);
+  } catch (err) {
+    summary.details.push(`Error buscando ejecuciones liquidables: ${(err as Error).message}`);
+    return;
+  }
+
+  for (const row of rows) {
+    try {
+      const pnl = Number(row.realized_pnl);
+      if (!Number.isFinite(pnl)) continue; // fail-closed: sin PnL no se settlea
+
+      updateDecisionOutcome(row.decision_id!, pnl);
+      db.prepare(`UPDATE decision_log SET outcome_source = ? WHERE id = ?`).run(
+        `mt5_reconciled:${row.execution_id}`,
+        row.decision_id!
+      );
+      summary.settled++;
+      summary.details.push(
+        `#${row.decision_id} ${row.d_symbol}: PnL realizado ${pnl > 0 ? "+" : ""}${pnl} USD ` +
+        `(evidencia MT5: order ${row.order_ticket ?? "?"} → position ${row.position_ticket ?? "?"}, ` +
+        `causa ${row.close_cause ?? "UNKNOWN"}) → lección desde ejecución reconciliada`
+      );
+
+      // Reflexión con LINEAGE completo (P0 §23): la lección nace SOLO de
+      // evidencia REALIZED + RECONCILED — jamás de UNKNOWN/FLOATING.
+      await reflectOnExperience({
+        symbol: row.d_symbol,
+        setup: `orden ${row.order_type ?? row.direction ?? ""} #${row.order_ticket ?? "?"} (execution ${row.execution_id.slice(0, 8)})`,
+        outcomePnl: pnl,
+        userNote:
+          pnl >= 0
+            ? `Trade cerrado en ganancia REAL (${pnl.toFixed(2)} USD, reconstruido de deals MT5) tras decisión #${row.decision_id}.`
+            : `Trade cerrado en pérdida REAL (${pnl.toFixed(2)} USD, reconstruido de deals MT5) tras decisión #${row.decision_id}. Revisar si el filtro del SOP falló o si fue riesgo de mercado normal.`,
+        source: "reflection",
+        evidence: {
+          decision_id: row.decision_id,
+          execution_id: row.execution_id,
+          order_ticket: row.order_ticket,
+          position_ticket: row.position_ticket,
+          close_cause: row.close_cause,
+          realized_pnl: pnl,
+          gross_pnl: row.gross_pnl,
+          commission: row.commission,
+          swap: row.swap,
+          fee: row.fee,
+          reconciliation_status: row.reconciliation_status,
+          provenance: "REAL_TRADE",
+        },
+        truthLevel: "OBSERVED",
+        memoryType: "EPISODIC",
+        confidence: evidenceConfidence(pnl, row.risk_amount),
+      }).catch(() => {});
+    } catch (err) {
+      summary.details.push(`#${row.decision_id}: error liquidando desde ejecución: ${(err as Error).message}`);
+    }
+  }
+}
+
+// ── FASE C: legado pre-P0 (sin executions) ──────────────────
+
+async function handleLegacyDecisions(
+  limit: number,
+  bridgeAlive: boolean,
+  summary: SettlementSummary
+): Promise<void> {
   let pending: Awaited<ReturnType<typeof getUnsettledExecuteDecisions>>;
   try {
     pending = getUnsettledExecuteDecisions(HORIZON_HOURS, limit);
   } catch (err) {
     summary.details.push(`Error listando decisiones pendientes: ${(err as Error).message}`);
-    return summary;
+    return;
   }
 
-  if (pending.length === 0) return summary;
-
-  const bridgeAlive = await MT5Bridge.health().catch(() => false);
   let positions: Awaited<ReturnType<typeof MT5Bridge.getPositions>> = [];
   if (bridgeAlive) {
     positions = await MT5Bridge.getPositions().catch(() => []);
@@ -98,12 +212,43 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
 
   for (const dec of pending) {
     try {
+      // ¿Tiene execution del sistema P0? → la FASE A/B ya se encargan;
+      // aquí solo gestionamos los casos sin execution (legado) o con
+      // ejecución terminal SIN posición (no hubo trade: expiración honesta).
+      const execution = getExecutionByDecisionId(dec.id);
+
+      if (execution) {
+        const terminalNoPosition =
+          (execution.execution_status === "REJECTED" ||
+            execution.execution_status === "CANCELLED" ||
+            execution.execution_status === "EXPIRED") &&
+          execution.reconciliation_status === "COMPLETE";
+        if (terminalNoPosition) {
+          // La ejecución terminó sin abrir posición: NO es pérdida ni
+          // ganancia — es una decisión que no llegó a operar.
+          markDecisionExpired(dec.id, `execution_${execution.execution_status.toLowerCase()}`);
+          summary.expired++;
+          summary.details.push(
+            `#${dec.id} ${dec.symbol}: ejecución ${execution.execution_status} sin posición → cerrada honestamente (no hubo trade)`
+          );
+        } else if ((dec.settle_attempts ?? 0) + 1 >= MAX_ATTEMPTS) {
+          // Ejecución viva/UNKNOWN tras todo el horizonte y los intentos:
+          // hueco de telemetría, JAMÁS interpretado como pérdida (§18).
+          markDecisionExpired(dec.id, "execution_unresolved_max_attempts");
+          summary.expired++;
+          summary.details.push(
+            `#${dec.id} ${dec.symbol}: ejecución ${execution.execution_status} sin resolución tras ${MAX_ATTEMPTS} intentos → expirada sin inventar resultado`
+          );
+        } else {
+          bumpSettleAttempts(dec.id);
+        }
+        continue;
+      }
+
       const order = getOrderByDecisionId(dec.id);
 
-      // ── Caso 1: EXECUTE sin orden vinculada → falta de seguimiento ──
+      // ── LEGADO: EXECUTE sin orden vinculada → falta de seguimiento ──
       if (!order) {
-        // Le damos una oportunidad extra: quizá la orden se colocó con el
-        // gate en off o por otra vía; tras MAX_ATTEMPTS lo damos por cerrado.
         if ((dec.settle_attempts ?? 0) + 1 >= MAX_ATTEMPTS) {
           markDecisionExpired(dec.id, "no_execution");
           summary.expired++;
@@ -116,53 +261,34 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
         continue;
       }
 
-      // ── Caso 2: PnL reportado manualmente en trade_performance ──
-      const manual = db
-        .prepare(
-          `SELECT result_pl, error_made, setup_detected FROM trade_performance
-           WHERE asset = ? COLLATE NOCASE
-             AND timestamp >= ?
-           ORDER BY timestamp DESC LIMIT 1`
-        )
-        .get(dec.symbol, dec.created_at) as
-        | { result_pl: number | null; error_made?: string; setup_detected?: string }
-        | undefined;
-
-      if (manual && typeof manual.result_pl === "number" && Number.isFinite(manual.result_pl)) {
-        await settleWithPnl(dec, order, manual.result_pl, "performance_log", false);
-        summary.settled++;
-        summary.details.push(
-          `#${dec.id} ${dec.symbol}: PnL ${manual.result_pl > 0 ? "+" : ""}${manual.result_pl} USD (log manual) → lección generada`
-        );
-        continue;
-      }
-
-      // ── Caso 3: bridge vivo → posición viva con profit flotante ──
+      // ── LEGADO: orden pre-P0 (sin execution_id) ──
+      // trade_performance YA NO es autoridad (P0 §21: eliminado). Solo queda
+      // la observación provisional de flotante, que NUNCA settlea ni genera
+      // lección (§16: floating ≠ realized), y la expiración honesta.
       if (bridgeAlive && order.ticket) {
         const live = positions.find((p) => p.ticket === order.ticket);
         if (live) {
-          // Posición sigue abierta tras el horizonte: estimamos con el
-          // flotante pero NO la cerramos (el mercado decide, no el settlement).
+          // Flotante = observación provisional. outcome_settled sigue en 0:
+          // no produce REALIZED, ni EXPERIENCE, ni alimentación de riesgo.
           updateDecisionOutcome(dec.id, Number(live.profit.toFixed(2)));
           db.prepare(
             `UPDATE decision_log SET outcome_settled = 0, outcome_source = 'floating_estimate' WHERE id = ?`
           ).run(dec.id);
           summary.estimated++;
           summary.details.push(
-            `#${dec.id} ${dec.symbol}: posición #${order.ticket} viva, flotante ${live.profit > 0 ? "+" : ""}${live.profit.toFixed(2)} USD (provisional)`
+            `#${dec.id} ${dec.symbol}: orden legada #${order.ticket} viva, flotante ${live.profit > 0 ? "+" : ""}${live.profit.toFixed(2)} USD (solo observación — NUNCA settlea)`
           );
           continue;
         }
 
-        // Posición ya no está abierta: cerrada por SL/TP/manual.
-        // Sin endpoint de history el PnL realizado no está disponible;
-        // pedimos al usuario el dato vía reflexión (queda pendiente hasta
-        // que lo reporte o venza el máximo de intentos).
+        // Posición legada cerrada sin execution P0: la historia de MT5 solo
+        // es accesible vía el reconciliador, y estos tickets no tienen
+        // execution_id. Hueco de telemetría honesto tras los intentos.
         if ((dec.settle_attempts ?? 0) + 1 >= MAX_ATTEMPTS) {
-          markDecisionExpired(dec.id, "position_closed_no_data");
+          markDecisionExpired(dec.id, "legacy_position_closed_no_execution");
           summary.expired++;
           summary.details.push(
-            `#${dec.id} ${dec.symbol}: posición #${order.ticket} cerrada pero sin PnL reportado → expirada sin datos`
+            `#${dec.id} ${dec.symbol}: orden legada #${order.ticket} cerrada sin execution P0 → expirada sin datos (no inventada)`
           );
         } else {
           bumpSettleAttempts(dec.id);
@@ -170,7 +296,7 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
         continue;
       }
 
-      // ── Caso 4: bridge muerto → reintentar con límite ──
+      // ── Bridge muerto todo el horizonte: expiración honesta ──
       if ((dec.settle_attempts ?? 0) + 1 >= MAX_ATTEMPTS) {
         markDecisionExpired(dec.id, "bridge_unavailable");
         summary.expired++;
@@ -185,13 +311,11 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
       bumpSettleAttempts(dec.id);
     }
   }
-
-  return summary;
 }
 
 /**
  * Confianza honesta de la evidencia (MemoryDV §9): magnitud del PnL cerrado
- * respecto al riesgo planeado de la orden (R múltiplo normalizado a [0,1]).
+ * respecto al riesgo planeado (R múltiplo normalizado a [0,1]).
  * Sin riesgo conocido → 0.5 (presencia de PnL real, magnitud desconocida).
  */
 function evidenceConfidence(pnl: number, riskAmount?: number | null): number {
@@ -201,48 +325,7 @@ function evidenceConfidence(pnl: number, riskAmount?: number | null): number {
   return Math.round(Math.min(1, Math.max(0.05, c)) * 1_000) / 1_000;
 }
 
-/**
- * Cierra una decisión con PnL real y dispara la reflexión automática.
- * La reflexión es best-effort: si falla, el outcome ya quedó guardado.
- *
- * Task 10-c (MemoryDV §9): la lección nace CON evidencia citable
- * (decision_id, símbolo, PnL, fuente del outcome) y truth_level='OBSERVED'
- * — el PnL cerrado es un hecho observado, no una inferencia del LLM.
- */
-async function settleWithPnl(
-  dec: { id: number; symbol: string; direction?: string | null; risk_pct?: number | null; confidence?: number | null },
-  order: { ticket?: number | null; volume?: number | null; direction?: string; risk_amount?: number | null },
-  pnl: number,
-  source: string,
-  _provisional: boolean
-): Promise<void> {
-  updateDecisionOutcome(dec.id, Number(pnl.toFixed(2)));
-  db.prepare(`UPDATE decision_log SET outcome_source = ? WHERE id = ?`).run(source, dec.id);
-
-  // Reflexión automática (patrón TradingAgents: settlement → reflector)
-  await reflectOnExperience({
-    symbol: dec.symbol,
-    setup: order ? `orden #${order.ticket ?? "?"} ${order.direction ?? dec.direction ?? ""}`.trim() : undefined,
-    outcomePnl: pnl,
-    userNote:
-      pnl >= 0
-        ? `Trade cerrado en ganancia (${pnl.toFixed(2)} USD) tras decisión #${dec.id} con confianza ${(dec.confidence ?? 0) * 100 | 0}%.`
-        : `Trade cerrado en pérdida (${pnl.toFixed(2)} USD) tras decisión #${dec.id} con confianza ${(dec.confidence ?? 0) * 100 | 0}%. Revisar si el filtro del SOP falló o si fue riesgo de mercado normal.`,
-    source: "reflection",
-    // ── MemoryDV: evidencia + verdad observada + tipo episódico ──
-    evidence: {
-      decision_id: dec.id,
-      symbol: dec.symbol,
-      pnl: Number(pnl.toFixed(2)),
-      outcome_source: source,
-    },
-    truthLevel: "OBSERVED",
-    memoryType: "EPISODIC",
-    confidence: evidenceConfidence(pnl, order?.risk_amount),
-  }).catch(() => {});
-}
-
-// ── Bucle de mantenimiento del agente (Fase 2 + 5 + consolidación §3) ──
+// ── Bucle de mantenimiento del agente (settlement + reconciliación) ──
 interface MaintenanceState {
   lastSettlementAt?: string;
   lastSettlement?: SettlementSummary;
@@ -258,7 +341,7 @@ export const maintenanceState: MaintenanceState = { running: false };
 let maintenanceStarted = false;
 
 /**
- * Arranca el bucle de settlement + triage en background.
+ * Arranca el bucle de settlement + reconciliación en background.
  * Idempotente: llamarlo dos veces no duplica intervalos.
  */
 export function startAgentMaintenance(): void {
@@ -268,16 +351,13 @@ export function startAgentMaintenance(): void {
   const intervalMin = Math.max(5, parseFloat(process.env.SETTLEMENT_INTERVAL_MIN ?? "60") || 60);
 
   const tick = async () => {
-    // El lock de concurrencia vive dentro de runSettlement (compartido con
-    // el endpoint y el tool); la consolidación §3 corre DENTRO de ese lock
-    // (ver runSettlement). Aquí solo registramos el resultado.
     try {
       const summary = await runSettlement(10);
       maintenanceState.lastSettlementAt = new Date().toISOString();
       maintenanceState.lastSettlement = summary;
-      if (summary.settled + summary.expired > 0) {
+      if (summary.settled + summary.expired + summary.resolved > 0) {
         console.log(
-          `[Settlement] ✅ ${summary.settled} settled · ${summary.estimated} estimados · ${summary.expired} expirados`
+          `[Settlement] ✅ ${summary.resolved} ejecuciones resueltas de ${summary.reconciled} · ${summary.settled} settled (real) · ${summary.estimated} flotantes · ${summary.expired} expiradas`
         );
       }
     } catch (err) {
@@ -289,6 +369,6 @@ export function startAgentMaintenance(): void {
   setTimeout(() => void tick(), 45_000);
   setInterval(() => void tick(), intervalMin * 60_000);
   console.log(
-    `[Settlement] 🔄 Bucle de settlement activo (horizonte ${HORIZON_HOURS}h, cada ${intervalMin}min)`
+    `[Settlement] 🔄 Bucle activo (reconciliación P0 + settlement, horizonte ${HORIZON_HOURS}h, cada ${intervalMin}min)`
   );
 }
