@@ -6,6 +6,7 @@ import {
   claimDecision,
   releaseDecision,
   saveOrder,
+  getStrategyContext,
 } from "../../database/sqlite.js";
 import { assertExecutionForDecision } from "../policy.js";
 import {
@@ -17,6 +18,7 @@ import {
   scheduleReconciliation,
 } from "../../execution/registry.js";
 import { reconcileExecution } from "../../execution/reconciler.js";
+import { ladderFinalTakeProfit, computeLadder, extractEngineStructuralTp, type LadderDirection } from "../../execution/tp_ladder.js";
 
 /**
  * Herramienta de ejecución de órdenes via MT5 local (sin MetaApi)
@@ -206,6 +208,23 @@ function formatPipValue(value: number, source: PipValueSource): string {
   return source === "symbol_info"
     ? `${value.toFixed(2)}$/pip/lote (symbol_info del broker)`
     : `${value}$/pip/lote (tabla PIP_VALUE_USD — añade symbol_info al bridge para exactitud total)`;
+}
+
+/**
+ * P1 — TP LADDER: TP estructural del Strategy Engine para esta decisión.
+ * SOLO se usa si el contexto proviene del engine en modo SOURCE (el plan
+ * ejecutado ES el del engine — coherencia garantizada) y la dirección del
+ * signal coincide con la orden. En SHADOW el signal es observación de OTRO
+ * plan (el LLM decidió): usar su TP contaminaría la escalera → null → 3R.
+ * Fail-closed: contexto hostil/ilegible → null (sin TP estructural).
+ */
+function loadEngineStructuralTp(decisionId: number | undefined, direction: string): number | null {
+  if (!decisionId) return null;
+  try {
+    return extractEngineStructuralTp(getStrategyContext(decisionId), direction as LadderDirection);
+  } catch {
+    return null;
+  }
 }
 
 export const executeTradeMT5: Tool = {
@@ -415,12 +434,28 @@ export const executeTradeMT5: Tool = {
       if (direction === "BUY") {
         entryPrice     = parseFloat((ask - retracementPips * pipSize).toFixed(digits));
         stopLossPrice  = parseFloat((entryPrice - stopLossPips * pipSize).toFixed(digits));
-        takeProfitPrice= parseFloat((entryPrice + stopLossPips * 3 * pipSize).toFixed(digits));
       } else {
         entryPrice     = parseFloat((bid + retracementPips * pipSize).toFixed(digits));
         stopLossPrice  = parseFloat((entryPrice + stopLossPips * pipSize).toFixed(digits));
-        takeProfitPrice= parseFloat((entryPrice - stopLossPips * 3 * pipSize).toFixed(digits));
       }
+
+      // P1 — TP LADDER: el TP del broker es tp3 de la escalera derivada del
+      // TP ESTRUCTURAL del engine (spec: TP = liquidez externa). Sin TP
+      // estructural válido → tp3 = 3R exacto (comportamiento pre-P1, degradación
+      // idéntica). El mantenimiento (Settlement FASE L) ejecuta los parciales.
+      const structuralTp = loadEngineStructuralTp(gatedDecisionId, direction);
+      takeProfitPrice = parseFloat(
+        ladderFinalTakeProfit(entryPrice, stopLossPrice, structuralTp, direction as LadderDirection).toFixed(digits),
+      );
+      const ladderForMd = computeLadder({
+        entry: entryPrice, sl: stopLossPrice, structuralTp, direction: direction as LadderDirection,
+        totalVolume: lotSize,
+        volumeStep: symbolInfo && symbolInfo.volumeStep > 0 ? symbolInfo.volumeStep : 0.01,
+        volumeMin: symbolInfo && symbolInfo.volumeMin > 0 ? symbolInfo.volumeMin : 0.01,
+      });
+      const tpLabel = ladderForMd.valid
+        ? `${takeProfitPrice} (TP Ladder: ${ladderForMd.levels.map((l) => `${l.label} ${l.price.toFixed(digits)} ×${l.volume}`).join(" · ")} · SL→BE tras TP1)`
+        : `${takeProfitPrice} (1:3 RR${structuralTp !== null ? " — TP estructural no apto para ladder" : ""})`;
 
       const orderType = direction === "BUY" ? "BUY_LIMIT" : "SELL_LIMIT";
 
@@ -481,7 +516,7 @@ export const executeTradeMT5: Tool = {
           `| **Tipo** | ${orderType} |`,
           `| **Precio Entrada** | ${entryPrice} |`,
           `| **Stop Loss** | ${stopLossPrice} (${stopLossPips} pips) |`,
-          `| **Take Profit** | ${takeProfitPrice} (1:3 RR) |`,
+          `| **Take Profit** | ${tpLabel} |`,
           `| **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |`,
           `| **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |`,
           `| **Ticket MT5** | — (demo, no enviado) |`,
@@ -608,7 +643,7 @@ export const executeTradeMT5: Tool = {
 | **Tipo** | ${orderType} |
 | **Precio Entrada** | ${entryPrice} |
 | **Stop Loss** | ${stopLossPrice} (${stopLossPips} pips) |
-| **Take Profit** | ${takeProfitPrice} (1:3 RR) |
+| **Take Profit** | ${tpLabel} |
 | **Expira** | ${expirationEpoch ? new Date(expirationEpoch * 1000).toISOString() : "—"} (${DECISION_VALIDITY_MINUTES} min) |
 | **Decisión** | #${gatedDecisionId ?? "—"} (consumida, one-shot) |
 | **Execution ID** | ${execution.execution_id} |

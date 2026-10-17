@@ -1215,6 +1215,23 @@ export function getExecutionEvents(executionId: string): Array<{
 }
 
 /**
+ * P1 — TP LADDER: ejecuciones con posición viva gestionables por la
+ * escalera (abiertas o parcialmente cerradas, con ticket de posición).
+ * Sin position_ticket no hay acción posible (fail-closed).
+ */
+export function getExecutionsForLadder(limit = 25): ExecutionRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM executions
+       WHERE position_ticket IS NOT NULL
+         AND execution_status IN ('FILLED', 'OPEN', 'PARTIALLY_CLOSED', 'PARTIALLY_FILLED')
+       ORDER BY updated_at ASC
+       LIMIT ?`
+    )
+    .all(limit) as ExecutionRow[];
+}
+
+/**
  * Ejecuciones que exigen reconciliación: PENDING_RECONCILIATION (incluye
  * UNKNOWN) con techo de intentos para no martillar un bridge muerto.
  */

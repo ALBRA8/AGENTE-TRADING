@@ -30,6 +30,11 @@ import db, {
   getOrderByDecisionId,
   getExecutionByDecisionId,
   getSettleableReconciledExecutions,
+  getExecutionsForLadder,
+  getExecutionDeals,
+  getExecutionEvents,
+  appendExecutionEvent,
+  getStrategyContext,
   updateDecisionOutcome,
   bumpSettleAttempts,
   markDecisionExpired,
@@ -37,6 +42,12 @@ import db, {
 } from "../database/sqlite.js";
 import { MT5Bridge } from "../config/mt5bridge.js";
 import { reconcilePendingExecutions } from "../execution/reconciler.js";
+import {
+  processTpLadders,
+  extractEngineStructuralTp,
+  isTpLadderEnabled,
+  type LadderDirection,
+} from "../execution/tp_ladder.js";
 import { reflectOnExperience } from "./self_improve.js";
 import { consolidateMemory, type ConsolidationSummary } from "./consolidation.js";
 
@@ -52,6 +63,7 @@ export interface SettlementSummary {
   settled: number; // decisiones cerradas con PnL REALIZADO (deals MT5)
   estimated: number; // flotante provisional (observación, NUNCA settlea)
   expired: number; // huecos de telemetría (no son pérdidas)
+  ladderActions: number; // P1: parciales + BE ejecutados por el TP Ladder
   details: string[];
 }
 
@@ -67,6 +79,7 @@ export async function runSettlement(limit = 10): Promise<SettlementSummary> {
     settled: 0,
     estimated: 0,
     expired: 0,
+    ladderActions: 0,
     details: [],
   };
 
@@ -111,6 +124,22 @@ async function runSettlementInner(limit: number, summary: SettlementSummary): Pr
     // §18: bridge caído ⇒ ejecuciones siguen UNKNOWN/PENDING — sin datos
     // falsos. La reconciliación se reintentará en el próximo ciclo.
     summary.details.push("Bridge MT5 caído: reconciliación diferida (estados UNKNOWN intactos)");
+  }
+
+  // ── FASE L: TP LADDER (P1) — parciales + BE desde evidencia ──
+  // El reconciler JAMÁS genera órdenes (invariante P0): la gestión de la
+  // escalera vive aquí, en la capa de mantenimiento. Estado derivado de
+  // evidencia en disco (exit deals + eventos) ⇒ restart-safe e idempotente.
+  // Bridge caído ⇒ diferido sin estado dañado: el TP del broker (= tp3)
+  // sigue acotando el trade (degradación = comportamiento pre-P1).
+  if (bridgeAlive) {
+    try {
+      await runTpLadderPass(summary);
+    } catch (err) {
+      summary.details.push(`TP Ladder falló (no crítico): ${(err as Error).message}`);
+    }
+  } else {
+    summary.details.push("Bridge MT5 caído: TP Ladder diferido (el broker TP acota el trade)");
   }
 
   // ── FASE B: LIQUIDAR desde ejecuciones CLOSED + COMPLETE (P0 §21/§22) ──
@@ -323,6 +352,121 @@ function evidenceConfidence(pnl: number, riskAmount?: number | null): number {
   if (!Number.isFinite(risk) || risk <= 0) return 0.5;
   const c = Math.abs(pnl) / risk;
   return Math.round(Math.min(1, Math.max(0.05, c)) * 1_000) / 1_000;
+}
+
+// ── FASE L: TP LADDER (P1) ──────────────────────────────────
+/**
+ * Gestión de la escalera de TPs para ejecuciones con posición viva
+ * (P1 aprobado por el propietario). Núcleo determinista en
+ * src/execution/tp_ladder.ts; aquí solo la orquestación:
+ *   1. Candidatas: ejecuciones FILLED/OPEN/PARTIALLY_* con position_ticket.
+ *   2. TP estructural desde decision_log.strategy_context (solo modo
+ *      source y dirección coherente — extractEngineStructuralTp).
+ *   3. Evidencia: exit deals (hard) + eventos TP_LADDER_PARTIAL (éxito
+ *      del executor pendiente de deal) ⇒ nivel consumido sin RAM.
+ *   4. Acciones vía MT5Bridge (close_position / modify_position); el
+ *      evento de éxito SOLO se persiste si el executor confirma — un
+ *      fallo de red se reintenta en el próximo ciclo (fail-closed).
+ */
+async function runTpLadderPass(summary: SettlementSummary): Promise<void> {
+  if (!isTpLadderEnabled()) return;
+  const rows = getExecutionsForLadder(25);
+  if (rows.length === 0) return;
+
+  const positions = await MT5Bridge.getPositions().catch(() => []);
+  const posMap = new Map(
+    positions.map((p) => [
+      Number(p.ticket),
+      {
+        ticket: Number(p.ticket),
+        volume: Number(p.volume),
+        currentPrice: Number(p.currentPrice),
+        sl: Number(p.sl),
+        tp: Number(p.tp),
+      },
+    ]),
+  );
+
+  const volumeRules = new Map<string, { volumeMin: number; volumeStep: number }>();
+  const symbolByExecution = new Map<string, string>();
+  const candidates: Array<{
+    executionId: string; direction: LadderDirection; entry: number; sl: number;
+    structuralTp: number | null; totalVolume: number; exitDeals: number;
+    maxSuccessLevel: number; positionTicket: number;
+  }> = [];
+
+  for (const e of rows) {
+    const dir: LadderDirection = String(e.direction).toUpperCase() === "SELL" ? "SELL" : "BUY";
+    const structuralTp = e.decision_id
+      ? extractEngineStructuralTp(getStrategyContext(e.decision_id), dir)
+      : null;
+
+    // Entrada de evidencia: primer deal entry (fill real); fallback precio solicitado.
+    const deals = getExecutionDeals(e.execution_id);
+    const entryDeal = deals.find((d) => d.role === "entry" && Number(d.price) > 0);
+    const entry = Number(entryDeal?.price ?? e.requested_price ?? 0);
+    const exitDeals = deals.filter((d) => d.role === "exit").length;
+
+    // Niveles consumidos por eventos de éxito (deal aún no visible).
+    const maxSuccessLevel = getExecutionEvents(e.execution_id)
+      .filter((ev) => ev.event === "TP_LADDER_PARTIAL" && ev.evidence_json)
+      .reduce((max, ev) => {
+        try {
+          return Math.max(max, Number((JSON.parse(ev.evidence_json as string) as { level?: number }).level) || 0);
+        } catch {
+          return max;
+        }
+      }, -1);
+
+    candidates.push({
+      executionId: e.execution_id,
+      direction: dir,
+      entry,
+      sl: Number(e.stop_loss ?? 0),
+      structuralTp,
+      totalVolume: Number(e.executed_volume ?? 0),
+      exitDeals,
+      maxSuccessLevel,
+      positionTicket: Number(e.position_ticket),
+    });
+    symbolByExecution.set(e.execution_id, e.symbol);
+
+    if (!volumeRules.has(e.symbol)) {
+      const info = await MT5Bridge.getSymbolInfo(e.symbol).catch(() => null);
+      volumeRules.set(e.symbol, {
+        volumeMin: info && info.volumeMin > 0 ? info.volumeMin : 0.01,
+        volumeStep: info && info.volumeStep > 0 ? info.volumeStep : 0.01,
+      });
+    }
+  }
+  if (candidates.length === 0) return;
+
+  const outcomes = await processTpLadders({
+    candidates,
+    positions: posMap,
+    volumeRules,
+    symbolByExecution,
+    closeExecutor: (ticket, volume) => MT5Bridge.closePosition(ticket, volume),
+    slExecutor: (ticket, sl) => MT5Bridge.modifyPosition(ticket, sl),
+    recordEvent: (executionId, levelIndex, payload) => {
+      try {
+        appendExecutionEvent(executionId, "TP_LADDER_PARTIAL", {
+          reason: `nivel ${levelIndex} ejecutado (P1 ladder)`,
+          evidenceJson: JSON.stringify(payload),
+        });
+      } catch {
+        // La observabilidad jamás debe romper la gestión del ladder.
+      }
+    },
+  });
+
+  summary.ladderActions = outcomes.filter((o) => o.applied).length;
+  for (const o of outcomes) {
+    if (o.applied) summary.details.push(`TP Ladder ${o.executionId}: ${o.reason}`);
+    else if (o.error) {
+      summary.details.push(`TP Ladder ${o.executionId} error (reintenta próximo ciclo): ${o.error}`);
+    }
+  }
 }
 
 // ── Bucle de mantenimiento del agente (settlement + reconciliación) ──

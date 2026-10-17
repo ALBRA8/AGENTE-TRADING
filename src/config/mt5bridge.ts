@@ -378,6 +378,55 @@ export const MT5Bridge = {
   },
 
   /**
+   * P1 — TP LADDER: cierra TOTAL o PARCIALMENTE una posición viva
+   * (POST /close_position del bridge). Sin `volume` el bridge cierra
+   * TODO. La posición puede no existir ya (SL/TP del broker) → el
+   * bridge responde 404 POSITION_NOT_FOUND (código clasificable) y el
+   * llamador debe reconciliar, no insistir.
+   */
+  async closePosition(
+    ticket: number,
+    volume?: number,
+    comment = "AGT-LADDER",
+  ): Promise<{ success: boolean; ticket: number; deal: number; closedVolume: number; remainingVolume: number; price: number }> {
+    const data = await bridgeFetch<{
+      success: boolean; ticket: number; deal: number;
+      closed_volume: number; remaining_volume: number; price: number;
+    }>("/close_position", {
+      method: "POST",
+      body: JSON.stringify({ ticket, ...(volume !== undefined ? { volume } : {}), comment }),
+    });
+    return {
+      success: Boolean(data.success),
+      ticket: Number(data.ticket),
+      deal: Number(data.deal),
+      closedVolume: Number(data.closed_volume),
+      remainingVolume: Number(data.remaining_volume),
+      price: Number(data.price),
+    };
+  },
+
+  /**
+   * P1 — TP LADDER: modifica SL/TP de una posición viva (POST
+   * /modify_position). El bridge valida fail-closed que el SL nunca
+   * aumente el riesgo (para LONG debe quedar < bid y no alejarse del
+   * SL actual; espejo para SHORT) — aquí no se re-valida: la frontera
+   * manda y sus 400/404/409 son clasificables vía bridgeFetch.
+   */
+  async modifyPosition(ticket: number, sl?: number, tp?: number): Promise<{ success: boolean; ticket: number; sl: number; tp: number }> {
+    const data = await bridgeFetch<{ success: boolean; ticket: number; sl: number; tp: number }>("/modify_position", {
+      method: "POST",
+      body: JSON.stringify({ ticket, ...(sl !== undefined ? { sl } : {}), ...(tp !== undefined ? { tp } : {}) }),
+    });
+    return {
+      success: Boolean(data.success),
+      ticket: Number(data.ticket),
+      sl: Number(data.sl),
+      tp: Number(data.tp),
+    };
+  },
+
+  /**
    * Cancela una orden pendiente.
    */
   async cancelOrder(ticket: number): Promise<boolean> {

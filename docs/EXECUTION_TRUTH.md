@@ -128,3 +128,14 @@ Nunca crean experiencia REAL_TRADE: UNKNOWN, FLOATING, UNRECONCILED, INCOMPLETE,
 ## 9. Cobertura de pruebas
 
 `tests/execution_truth.test.ts` — **91 asserts, 0 fallos** contra mock bridge (serialización idéntica a bridge.py): los 30 escenarios §29 + especiales §30 (response-lost, 8 pasos), §31 (UNKNOWN sin resultado inventado), §32 (idempotencia ×10) + restart con proceso hijo (§14/§29). Suite completa del repo: verde (354 asserts, EXIT 0).
+
+## 10. P1 — TP LADDER con cierres parciales (2026-10-18)
+
+Extensión aprobada por el propietario sobre la infraestructura P0 (N exit deals ya soportados):
+
+- **Núcleo determinista**: `src/execution/tp_ladder.ts` — TP1 = TP estructural del engine (spec: liquidez externa, exige rr ≥ 1); TP2 = max(2R, TP1+0.5R); TP3 = max(3R, TP2+0.5R) = **TP del broker**. Volúmenes 50/30/20 redondeados a `volume_step` con degradación honesta (2 niveles → sin ladder) por `volume_min`.
+- **Origen del TP estructural**: `decision_log.strategy_context` SOLO en modo `source` y con dirección coherente (`extractEngineStructuralTp`) — el signal de SHADOW es observación de otro plan y jamás contamina la escalera.
+- **Acciones**: al tocar cada nivel → cierre parcial a mercado (`POST /close_position`, TRADE_ACTION_DEAL con `position=ticket`); tras el TP1 → SL→BE (`POST /modify_position`) solo si mejora el stop. Un nivel se consume SOLO por evidencia (exit deal o evento `TP_LADDER_PARTIAL` de éxito) ⇒ idempotente y restart-safe sin RAM.
+- **Cableado**: Settlement **FASE L** (entre reconciliación y liquidación) — el reconciler JAMÁS genera órdenes (invariante P0 intacta). Bridge caído ⇒ diferido: el TP del broker (tp3) acota el trade con el comportamiento pre-P1 (degradación idéntica).
+- **Flag**: `TP_LADDER=off` desactiva; default activado (inerte sin TP estructural).
+- **Tests**: `tests/tp_ladder.test.ts` — 79 asserts (niveles/volúmenes/triggers/BE/dedupe/fail-closed/orquestación con executors stub/SQLite temporal + settlement sin bridge).

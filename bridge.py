@@ -488,6 +488,112 @@ def modify_position():
     })
 
 
+@app.route("/close_position", methods=["POST"])
+def close_position():
+    """
+    P1 — TP LADDER: cierra TOTAL o PARCIALMENTE una posición abierta.
+    Body JSON:
+    {
+      "ticket":  123456789,   (obligatorio — jamás ambigüedad por símbolo)
+      "volume":  0.05,        (opcional; ausente/None = cerrar TODO)
+      "comment": "AGT-LADDER-TP1"  (opcional)
+    }
+    Implementación: TRADE_ACTION_DEAL con la operación CONTRARIA y
+    position=ticket (semántica oficial MT5 para cierres parciales; en
+    cuentas netting el volumen contrario reduce la posición igual).
+    Validaciones fail-closed:
+      - mismo candado X-AGT-Token que /order y /modify_position,
+      - la posición debe existir (404 limpio, sin stack traces),
+      - 0 < volume <= posición.volume (si no → 400; un volumen mayor
+        es ambiguo y NO se recorta silenciosamente),
+      - precio del tick REAL (bid para cerrar BUY, ask para cerrar
+        SELL) con deviation=20 como el resto de la frontera.
+    """
+    body = request.get_json(force=True)
+    if not body:
+        return jsonify({"error": "Body JSON requerido"}), 400
+
+    denied = check_bridge_token()
+    if denied:
+        return denied
+    if not request.is_json:
+        return jsonify({"error": "Content-Type debe ser application/json"}), 415
+
+    raw_ticket = body.get("ticket")
+    raw_volume = body.get("volume")          # None → cerrar TODO
+    comment    = body.get("comment", "AGT-LADDER")
+
+    try:
+        ticket = int(raw_ticket)
+    except (TypeError, ValueError):
+        return jsonify({"error": f"ticket inválido: {raw_ticket!r}"}), 400
+
+    positions = mt5.positions_get(ticket=ticket)
+    if positions is None or len(positions) == 0:
+        # 404 honesto: la posición ya no existe (el broker la cerró por
+        # SL/TP/stop-out) — el llamador debe reconciliar, no insistir.
+        return jsonify({"error": f"Posición no encontrada en MT5 (ticket={raw_ticket!r})", "code": "POSITION_NOT_FOUND"}), 404
+
+    pos = positions[0]
+    close_volume = float(pos.volume) if raw_volume is None else float(raw_volume)
+    if close_volume <= 0:
+        return jsonify({"error": f"volume inválido: {close_volume} (debe ser > 0)"}), 400
+    if close_volume > float(pos.volume) + 1e-8:
+        return jsonify({
+            "error": f"volume {close_volume} excede el volumen vivo de la posición ({pos.volume}): ambiguo → rechazado (fail-closed)",
+        }), 400
+
+    is_long = pos.type == mt5.POSITION_TYPE_BUY
+    tick = mt5.symbol_info_tick(pos.symbol)
+    if tick is None:
+        return jsonify({"error": f"No se pudo obtener el tick de {pos.symbol}", "detail": str(mt5.last_error())}), 500
+
+    request_data = {
+        "action":        mt5.TRADE_ACTION_DEAL,
+        "symbol":        pos.symbol,
+        "volume":        close_volume,
+        "type":          mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY,
+        "position":      pos.ticket,
+        "price":         tick.bid if is_long else tick.ask,
+        "deviation":     20,
+        "magic":         234000,
+        "comment":       str(comment)[:31],
+        "type_time":     mt5.ORDER_TIME_GTC,
+        "type_filling":  mt5.ORDER_FILLING_IOC,
+    }
+
+    log.info(f"Cierre {'parcial' if raw_volume is not None and close_volume < float(pos.volume) else 'total'} de posición: {json.dumps({k: v for k, v in request_data.items() if k != 'action'}, default=str)}")
+    result = mt5.order_send(request_data)
+
+    if result is None:
+        return jsonify({"error": "order_send devolvió None", "detail": str(mt5.last_error())}), 500
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return jsonify({
+            "error":   f"Cierre rechazado por MT5 (retcode: {result.retcode})",
+            "comment": result.comment,
+            "retcode": result.retcode,
+        }), 400
+
+    # Los valores REALES del deal (nunca los del request — §13).
+    actual_volume = float(getattr(result, "volume", 0) or 0)
+    actual_price  = float(getattr(result, "price", 0) or 0)
+    remaining     = float(pos.volume) - (actual_volume if actual_volume > 0 else close_volume)
+    log.info(f"Posición cerrada (parcial={remaining > 1e-8}): ticket={pos.ticket}, deal={result.deal}, retcode={result.retcode}, restante={max(0.0, remaining)}")
+    return jsonify({
+        "success":        True,
+        "ticket":         pos.ticket,
+        "deal":           result.deal,
+        "retcode":        result.retcode,
+        "closed_volume":  actual_volume if actual_volume > 0 else close_volume,
+        "remaining_volume": max(0.0, remaining),
+        "price":          actual_price if actual_price > 0 else request_data["price"],
+        "symbol":         pos.symbol,
+        "type":           "BUY" if is_long else "SELL",
+        "comment":        result.comment,
+    })
+
+
 @app.route("/positions", methods=["GET"])
 def get_positions():
     """Lista las posiciones abiertas actuales."""
