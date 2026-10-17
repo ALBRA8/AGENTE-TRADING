@@ -28,6 +28,7 @@ Cuando un dato no esté confirmado, debe conservarse como UNKNOWN / pendiente de
 3. `03_EXECUTION_TRUTH_P0.md` — contrato e implementación P0 de verdad de ejecución MT5.
 4. `04_ESTADO_ACTUAL_Y_PROXIMOS_PASOS.md` — qué está terminado, qué está pendiente y qué NO debe hacerse todavía.
 5. `05_REGLAS_DE_CONTINUIDAD.md` — reglas para continuar el proyecto sin perder contexto ni duplicar arquitectura.
+6. `06_DISENO_DOBLE_ESCENARIO_Y_EVOLUCION.md` — diseño propuesto del escenario A operativo, escenario B de experimentación ficticia, evolución/versionado de estrategias y posible generación futura de Pine Script. **Diseño, no implementación verificada.**
 
 ## Principio central
 
