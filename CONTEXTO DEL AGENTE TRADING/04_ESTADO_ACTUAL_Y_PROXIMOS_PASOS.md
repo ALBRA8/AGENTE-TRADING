@@ -96,16 +96,29 @@ Es una base útil para futuros counterfactuals.
 
 `decision → execution → order → deal → position → exit deal → realized → reconciliation`
 
-6. Confirmar respuesta perdida/ambiguidades cuando puedan probarse de forma segura.
+6. Confirmar respuesta perdida/ambigüedades cuando puedan probarse de forma segura.
 7. Auditar P0 post-implementación.
 
-### FASE 2 — No tocar todavía Strategy Evolution
+### FASE 2 — Diseño de Strategy Evolution (documentación permitida; implementación operativa aún bloqueada)
 
-Solo después de comprobar que los resultados reales son fiables.
+La intención de producto ya está registrada en `06_DISENO_DOBLE_ESCENARIO_Y_EVOLUCION.md`.
 
-### FASE 3 — Strategy Evolution
+Modelo deseado:
+- **Escenario A:** estrategia/version de referencia que opera en el modo autorizado y conserva trazabilidad.
+- **Escenario B:** laboratorio aislado de entradas ficticias, counterfactuals, backtests y experimentos; puede explorar muchas hipótesis sin enviar órdenes al bróker.
+- El escenario B aprende de resultados etiquetados por procedencia y produce candidatos/versiones.
+- Ningún candidato reemplaza A automáticamente por una prueba aislada. La promoción requiere validación reproducible, comparación contra baseline y gates predefinidos.
+- La generación futura de un Pine Script es una posibilidad por evaluar; no está verificada como capacidad actual y no reemplaza al Strategy Engine canónico.
 
-Cuando P0 esté validado:
+Se puede diseñar el contrato del laboratorio y auditar los componentes actuales antes de validar P0. Sin embargo, la implementación completa de la evolución y cualquier promoción de estrategias debe respetar la dependencia de Execution Truth descrita abajo. La documentación de esta visión no significa que el sistema de doble escenario ya esté implementado.
+
+### FASE 3 — Validación de Execution Truth antes de evolución completa
+
+Antes de confiar en experiencias LIVE, comprobar P0 en SHADOW/demo y confirmar que la genealogía y reconciliación son fiables.
+
+### FASE 4 — Strategy Evolution
+
+Cuando Execution Truth esté validado, evolucionar hacia:
 
 ExperienceRecord
 → CounterfactualExperience
@@ -136,7 +149,7 @@ Debe compararse contra baseline con:
 - régimen;
 - riesgo;
 - costes de ejecución;
-- criterios estadísticos.
+- criterios estadísticos definidos de antemano.
 
 ## Integración futura con AGENTE-GENERAL
 
@@ -159,6 +172,8 @@ Trading debe entregar al General sus capacidades y experiencias mediante adapter
 - no rehacer pipeline completo;
 - no rediseñar General;
 - no activar dinero real solo porque P0 tiene tests verdes;
-- no implementar Strategy Evolution antes de validar execution truth real;
+- no tratar el laboratorio de evolución completo como si ya estuviera implementado;
+- no implementar/promover estrategias autónomas antes de validar execution truth;
 - no convertir US30 V1 en verdad universal;
-- no mezclar conocimiento de vídeos con código de estrategia sin versionarlo.
+- no mezclar conocimiento de vídeos con código de estrategia sin versionarlo;
+- no dar acceso al bróker al escenario B de experimentación ficticia.
