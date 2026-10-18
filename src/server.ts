@@ -112,8 +112,11 @@ export function startDashboard(port: number = 3000) {
     });
   }
 
-  // Serve static files from the 'public' directory
-  app.use(express.static(path.join(__dirname, "../public")));
+  // Serve static files. Default: 'public'. Override con DASHBOARD_STATIC_DIR
+  // (p.ej. DASHBOARD_STATIC_DIR=../public_adaptada para el dashboard completo
+  // con Track Record / Policy / Brain / Doctor / Skills).
+  const staticDir = process.env.DASHBOARD_STATIC_DIR ?? "../public";
+  app.use(express.static(path.join(__dirname, staticDir)));
 
   // Mantenimiento en background: settlement + triage de errores (Fase 2/5)
   startAgentMaintenance();

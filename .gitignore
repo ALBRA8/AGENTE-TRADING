@@ -35,3 +35,6 @@ npm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Runtime logs (kit de arranque doble clic)
+logs/

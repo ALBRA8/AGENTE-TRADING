@@ -1,0 +1,39 @@
+================================================================
+  AGENTE TRADING - ARRANQUE CON DOBLE CLIC
+================================================================
+
+COMO SE USA (lo unico que tienes que saber):
+
+  1-INICIAR-AGENTE.bat      DOBLE CLIC y listo. Arranca el Bridge
+                            MT5 + el Bot con el Dashboard y te abre
+                            el navegador en http://127.0.0.1:4000
+
+  2-ESTADO-AGENTE.bat       Doble clic para ver si todo esta vivo
+                            y abrir la carpeta de logs.
+
+  3-PARAR-AGENTE.bat        Doble clic para pararlo todo.
+
+  4-CONFIGURAR-INICIO-AUTOMATICO.bat   Ejecutalo UNA vez y el
+                            agente arrancara SOLO cada vez que
+                            enciendas el PC (silencioso, sin
+                            navegador). Para deshacerlo: el numero 5.
+
+QUE HACE EL INICIADOR POR TI:
+
+  - Comprueba que existe .env (si falta, te avisa)
+  - Si es la primera vez, instala las dependencias (npm install)
+  - Comprueba si MT5 esta abierto (si no, avisa pero arranca igual)
+  - Comprueba si el Bridge o el Bot ya estaban corriendo (no duplica)
+  - Deja dos consolas minimizadas en la barra de tareas:
+        AGT-Bridge  -> logs\bridge.log
+        AGT-Bot     -> logs\bot.log
+  - Registra cada arranque en logs\arranque.log
+
+NOTAS:
+
+  - Si cierras las ventanitas minimizadas de la barra de tareas,
+    CORTAS el agente (es lo mismo que 3-PARAR-AGENTE.bat).
+  - Cualquier problema: doble clic en 2-ESTADO-AGENTE.bat y mira
+    los ficheros de logs\ .
+  - deploy_trading.ps1 se queda obsoleto con este kit (no hace
+    falta tocarlo ni borrarlo).
