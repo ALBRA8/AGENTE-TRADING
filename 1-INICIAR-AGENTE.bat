@@ -12,6 +12,8 @@ rem
 rem  Variables (las cambia arranque_silencioso.vbs en el auto-arranque):
 rem    SILENCIOSO=1  -> no muestra panel final ni pausas de error
 rem    ABRIR_DASH=0  -> no abre el navegador al terminar
+rem    ACTUALIZAR=0  -> salta el despliegue automatico de GitHub
+rem  (alternativa: crea un fichero vacio NO_ACTUALIZAR.txt aqui)
 rem ================================================================
 
 if not defined SILENCIOSO set SILENCIOSO=0
@@ -49,9 +51,49 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if not exist "node_modules" (
-  echo [INFO] Primera ejecucion: instalando dependencias (npm install)...
+rem ------------------------------------------------------------
+rem 1b) DESPLIEGUE AUTOMATICO: baja novedades de GitHub y las
+rem     instala solo. Sin terminal y sin claves (repo publico).
+rem     Se salta si: ACTUALIZAR=0  o  existe NO_ACTUALIZAR.txt
+rem ------------------------------------------------------------
+set FALTA_INSTALL=0
+if not exist "node_modules" set FALTA_INSTALL=1
+
+if not defined ACTUALIZAR set ACTUALIZAR=1
+if exist "NO_ACTUALIZAR.txt" set ACTUALIZAR=0
+
+if "%ACTUALIZAR%"=="1" if exist ".git" (
+  echo [....] Comprobando novedades en GitHub...
+  set "SHA_ANTES="
+  for /f %%A in ('git rev-parse HEAD 2^>nul') do set "SHA_ANTES=%%A"
+  git fetch https://github.com/ALBRA8/AGENTE-TRADING.git main >nul 2>&1
+  if errorlevel 1 (
+    echo [AVISO] Sin acceso a GitHub: arranco con tu version local.
+  ) else (
+    git merge --ff-only FETCH_HEAD >> logs\arranque.log 2>&1
+    if errorlevel 1 (
+      echo [AVISO] No pude actualizar solo ^(tienes cambios locales^): arranco con tu version.
+    ) else (
+      set "SHA_DESPUES="
+      for /f %%A in ('git rev-parse HEAD 2^>nul') do set "SHA_DESPUES=%%A"
+      if "!SHA_ANTES!"=="!SHA_DESPUES!" (
+        echo [OK]   Codigo al dia.
+      ) else (
+        echo [OK]   DESPLIEGUE AUTOMATICO: instalada la ultima version de GitHub.
+        echo [%date% %time%] UPDATE: novedades descargadas desde GitHub >> logs\arranque.log
+        set FALTA_INSTALL=1
+      )
+    )
+  )
+)
+
+if "%FALTA_INSTALL%"=="1" (
+  echo [INFO] Instalando dependencias ^(npm install, la primera vez tarda^)...
   call npm install --no-audit --no-fund >> logs\install.log 2>&1
+  if errorlevel 1 (
+    echo [AVISO] npm install devolvio error: revisa logs\install.log
+    echo         El agente intenta arrancar igualmente.
+  )
 )
 
 set RUN_CMD=node dist\index.js

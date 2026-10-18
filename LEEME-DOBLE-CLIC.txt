@@ -24,10 +24,26 @@ QUE HACE EL INICIADOR POR TI:
   - Si es la primera vez, instala las dependencias (npm install)
   - Comprueba si MT5 esta abierto (si no, avisa pero arranca igual)
   - Comprueba si el Bridge o el Bot ya estaban corriendo (no duplica)
+  - Comprueba si hay novedades en GitHub y se actualiza solo
+    (despliegue automatico; se desactiva con NO_ACTUALIZAR.txt)
   - Deja dos consolas minimizadas en la barra de tareas:
         AGT-Bridge  -> logs\bridge.log
         AGT-Bot     -> logs\bot.log
   - Registra cada arranque en logs\arranque.log
+
+DESPLIEGUE AUTOMATICO (lo nuevo):
+
+  Cada vez que haces doble clic en 1-INICIAR-AGENTE.bat, el agente
+  comprueba GitHub y, si hay novedades, se las instala SOLO antes
+  de arrancar (y actualiza dependencias si hace falta). No pide
+  claves ni abre terminal: el repositorio es publico.
+
+  - Sin internet: arranca con tu version local y te avisa.
+  - Si tienes cambios propios sin subir: arranca con tu version
+    y te avisa (no toca nada tuyo).
+  - Para congelar la version un dia: crea un fichero vacio llamado
+    NO_ACTUALIZAR.txt en la carpeta del agente (clic derecho ->
+    Nuevo -> Documento de texto) y listo.
 
 NOTAS:
 
