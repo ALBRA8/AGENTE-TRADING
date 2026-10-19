@@ -1,33 +1,8 @@
 //@version=5
 // ============================================================================
-// ZARUS30 & SMC Master Engine - Limpia (v2.1)
-// ----------------------------------------------------------------------------
-// MISMA MOTORICA que la "Réplica Total (v2)" (senales, SL por activo, alertas
-// JSON para el bot, sin repintado), con la CAPA VISUAL reorganizada para que
-// el grafico se lea limpio:
-//   7. CAPAS VISUALES CONFIGURABLES: cada bloque (EQH/EQL, CHoCH, Strong/Weak,
-//      Premium/Discount, zonas OB, plan de trade, nube, PDH/PDL) tiene su
-//      interruptor en "4. Visualizacion".
-//   8. RETENCION LIMITADA: solo se mantien en pantalla los ultimos N elementos
-//      (zonas OB, CHoCH, EQH/EQL configurables). Lo antiguo se borra solo.
-//   9. ZONAS MITIGADAS: por defecto desaparecen (antes quedaban congeladas
-//      ensuciando el historico). Opcion para dejarlas atenuadas.
-//  10. PDH/PDL RECIENTES: en vez de dos lineas cruzando todo el historico,
-//      solo se dibujan en las ultimas velas configurables.
-//  11. JERARQUIA DE LINEAS: SL solido grueso, TPs discontinuos finos, retest
-//      morado discontinuo. Texto dentro de las zonas OB desactivado por
-//      defecto (opcional).
-//
-// Arreglos 1-6 de la v2 se conservan (sin repintado, arranque robusto, zonas
-// robustas, SL por activo, alertas, PD inline).
-//
-// Cómo activar la alerta para el bot:
-//   Crear alerta -> Condicion = "Cualquier llamada a la funcion alert()"
-//   (Any alert() function call) -> Webhook URL del bot. Operar en la APERTURA
-//   de la vela siguiente al aviso (la senal se imprime al cierre).
+// ZARUS30 & SMC Master Engine - Limpia (v2.2 Blindada)
 // ============================================================================
-
-indicator("ZARUS30 & SMC Master Engine - Limpia (v2.1)", overlay=true, max_labels_count=500, max_boxes_count=200, max_lines_count=200)
+indicator("ZARUS30 & SMC Master Engine - Limpia (v2.2)", overlay=true, max_labels_count=500, max_boxes_count=200, max_lines_count=200)
 
 // ==========================================
 // 1. PARÁMETROS DE CONFIGURACIÓN
@@ -51,7 +26,7 @@ left_bars    = input.int(5, "Pivotes Izquierda", group=group_smc)
 right_bars   = input.int(3, "Pivotes Derecha", group=group_smc)
 eq_thresh    = input.float(0.15, "Tolerancia EQH/EQL (Factor ATR)", group=group_smc)
 
-group_vis    = "4. Visualización (limpieza del gráfico)"
+group_vis    = "4. Visualización"
 proj_bars    = input.int(22, "Extensión del Plan (velas)", group=group_vis)
 mostrar_pd   = input.bool(true, "PDH / PDL", group=group_vis)
 pd_bars      = input.int(60, "PDH/PDL: solo últimas velas", minval=10, maxval=500, group=group_vis)
@@ -66,10 +41,10 @@ mostrar_obs  = input.bool(true, "Zonas OB", group=group_vis)
 max_obs      = input.int(2, "Zonas OB: máximo en pantalla", minval=1, maxval=10, group=group_vis)
 ob_extend    = input.int(10, "Zonas OB: extensión (velas)", minval=0, maxval=100, group=group_vis)
 ob_texto     = input.bool(false, "Texto dentro de la zona OB", group=group_vis)
-dejar_mitig  = input.bool(false, "Dejar zonas mitigadas (atenuadas)", group=group_vis)
+dejar_mitig  = input.bool(false, "Dejar zonas mitigadas", group=group_vis)
 mostrar_plan = input.bool(true, "Plan de trade (SL / TPs)", group=group_vis)
 
-// SL POR ACTIVO (arreglo 4: autodetección; antes solo US30 y Oro)
+// Selección dinámica del Stop Loss
 sl_points = us30_sl_pts
 if str.contains(syminfo.ticker, "BTC")
     sl_points := btc_sl_pts
@@ -81,14 +56,13 @@ else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOL
     sl_points := gold_sl_pts
 
 // ==========================================
-// 2. REFERENCIAS MACRO (PDH / PDL)
+// 2. REFERENCIAS MACRO (PDH / PDL SIN LOOKAHEAD PROBLEMÁTICO)
 // ==========================================
-// arreglo 10: solo se pintan en las ultimas pd_bars velas del dia en curso
-bars_today  = nz(ta.barssince(ta.change(time("D")) != 0), 99999)
-pd_visible  = mostrar_pd and bars_today <= pd_bars
+bars_today = nz(ta.barssince(ta.change(time("D")) != 0), 99999)
+pd_visible = mostrar_pd and bars_today <= pd_bars
 
-pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
-pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
 
 plot(pd_visible ? pdh : na, "PDH", color=color.new(#b2b5be, 0), linewidth=1, style=plot.style_line)
 plot(pd_visible ? pdl : na, "PDL", color=color.new(#089981, 0), linewidth=1, style=plot.style_line)
@@ -96,13 +70,12 @@ plot(pd_visible ? pdl : na, "PDL", color=color.new(#089981, 0), linewidth=1, sty
 // ==========================================
 // 3. CANAL STEPPED ATR (NUBE DINÁMICA)
 // ==========================================
-// arreglos 1 y 2: estado SOLO al cierre de vela y disparos con dirección previa
 atr_val    = ta.atr(atr_len)
 upper_band = high - (atr_mult * atr_val)
 lower_band = low + (atr_mult * atr_val)
 
 var float trail_stop = na
-var int   trend_dir  = 0 // 1 = Alcista, -1 = Bajista
+var int   trend_dir  = 0
 var int   prev_dir   = 0
 
 bool buy_trigger  = false
@@ -125,11 +98,10 @@ if barstate.isconfirmed
             trail_stop := upper_band
         else
             trail_stop := math.min(trail_stop, lower_band)
-    // Flip confirmado (arreglo 2: prev_dir +/-1 excluye disparos de arranque)
+
     buy_trigger  := trend_dir == 1 and prev_dir == -1
     sell_trigger := trend_dir == -1 and prev_dir == 1
 
-// Trazado de la nube (arreglo 7: la nube tiene interruptor)
 p_price = plot(hl2, display=display.none)
 p_band  = plot(trail_stop, "Banda Dinámica", color=trend_dir == 1 ? color.new(color.green, 20) : color.new(color.red, 20), style=plot.style_stepline, linewidth=2)
 fill(p_price, p_band, color=mostrar_nube ? (trend_dir == 1 ? color.new(color.green, 90) : color.new(color.red, 90)) : na)
@@ -143,13 +115,8 @@ p_lo = ta.pivotlow(low, left_bars, right_bars)
 var float last_ph = na
 var float last_pl = na
 
-// Retencion limitada EQH/EQL (arreglo 8)
 var label[] eq_labels = array.new<label>()
 var line[]  eq_lines  = array.new<line>()
-
-// Detección EQH / EQL (arreglo 3: guardas na y coordenadas nunca negativas)
-var float prev_ph = na
-var float prev_pl = na
 tol_range = atr_val * eq_thresh
 
 if not na(p_hi) and not na(atr_val)
@@ -159,7 +126,6 @@ if not na(p_hi) and not na(atr_val)
         if array.size(eq_labels) > eq_historial
             label.delete(array.shift(eq_labels))
             line.delete(array.shift(eq_lines))
-    prev_ph := last_ph
     last_ph := p_hi
 
 if not na(p_lo) and not na(atr_val)
@@ -169,10 +135,8 @@ if not na(p_lo) and not na(atr_val)
         if array.size(eq_labels) > eq_historial
             label.delete(array.shift(eq_labels))
             line.delete(array.shift(eq_lines))
-    prev_pl := last_pl
     last_pl := p_lo
 
-// Manejo de Niveles Strong / Weak y Premium / Discount
 var line  l_strong  = na
 var line  l_weak    = na
 var label lb_strong = na
@@ -181,7 +145,6 @@ var label lb_prem   = na
 var label lb_eq     = na
 var label lb_disc   = na
 
-// Zonas Order Blocks con Mitigación
 type OB
     box   b
     float top
@@ -189,10 +152,6 @@ type OB
     bool  bull
 
 var OB[] obs = array.new<OB>()
-
-// Rompimiento Alcista (CHoCH / BOS) — arreglos 1 y 3: SOLO vela confirmada,
-// pivotes/ATR existentes, zona en el lado correcto del precio y left >= 0
-// Retencion limitada de etiquetas CHoCH (arreglo 8)
 var label[] choch_labels = array.new<label>()
 
 if barstate.isconfirmed
@@ -213,11 +172,9 @@ if barstate.isconfirmed
         if mostrar_sw
             l_strong  := line.new(bar_index - right_bars, last_pl, bar_index + 20, last_pl, color=color.new(color.teal, 30), width=1)
             lb_strong := label.new(bar_index + 20, last_pl, "Strong Low", color=color.new(color.white, 100), textcolor=color.new(color.teal, 20), style=label.style_label_left, size=size.tiny)
-
             l_weak    := line.new(bar_index, high + (atr_val * 1.5), bar_index + 20, high + (atr_val * 1.5), color=color.new(color.maroon, 30), width=1)
             lb_weak   := label.new(bar_index + 20, high + (atr_val * 1.5), "Weak High", color=color.new(color.white, 100), textcolor=color.new(color.maroon, 20), style=label.style_label_left, size=size.tiny)
 
-        // Premium / Equilibrium / Discount (arreglo 6: inline, se recrean en cada ruptura; arreglo 7: interruptor)
         label.delete(lb_prem)
         label.delete(lb_eq)
         label.delete(lb_disc)
@@ -248,11 +205,9 @@ if barstate.isconfirmed
         if mostrar_sw
             l_strong  := line.new(bar_index - right_bars, last_ph, bar_index + 20, last_ph, color=color.new(color.maroon, 30), width=1)
             lb_strong := label.new(bar_index + 20, last_ph, "Strong High", color=color.new(color.white, 100), textcolor=color.new(color.maroon, 20), style=label.style_label_left, size=size.tiny)
-
             l_weak    := line.new(bar_index, low - (atr_val * 1.5), bar_index + 20, low - (atr_val * 1.5), color=color.new(color.teal, 30), width=1)
             lb_weak   := label.new(bar_index + 20, low - (atr_val * 1.5), "Weak Low", color=color.new(color.white, 100), textcolor=color.new(color.teal, 20), style=label.style_label_left, size=size.tiny)
 
-        // Premium / Equilibrium / Discount (arreglo 6: inline, se recrean en cada ruptura; arreglo 7: interruptor)
         label.delete(lb_prem)
         label.delete(lb_eq)
         label.delete(lb_disc)
@@ -269,13 +224,10 @@ if barstate.isconfirmed
             array.push(obs, OB.new(box_sell, last_ph + (atr_val * 0.6), last_ph, false))
         last_pl := na
 
-    // Retencion limitada de zonas OB (arreglo 8: solo las max_obs mas recientes)
     while array.size(obs) > max_obs
         OB viejo = array.shift(obs)
         box.delete(viejo.b)
 
-    // Mitigación dinámica de zonas OB (arreglo 9: mitigadas se borran por defecto,
-    // o quedan atenuadas si dejar_mitig esta activo)
     if array.size(obs) > 0
         for i = array.size(obs) - 1 to 0
             o = array.get(obs, i)
@@ -292,17 +244,17 @@ if barstate.isconfirmed
                 box.set_right(o.b, bar_index + ob_extend)
 
 // ==========================================
-// 5. GATILLO DE EJECUCIÓN & LÍNEA MORADA
+// 5. GATILLO DE EJECUCIÓN CON BREAKER MORADO
 // ==========================================
-var label lb_trade_main   = na
-var label lb_trade_sl     = na
-var label lb_tp1          = na
-var label lb_tp2          = na
-var label lb_tp3          = na
-var line  ln_tp1          = na
-var line  ln_tp2          = na
-var line  ln_tp3          = na
-var line  ln_sl           = na
+var label lb_trade_main    = na
+var label lb_trade_sl      = na
+var label lb_tp1           = na
+var label lb_tp2           = na
+var label lb_tp3           = na
+var line  ln_tp1           = na
+var line  ln_tp2           = na
+var line  ln_tp3           = na
+var line  ln_sl            = na
 var line  ln_retest_purple = na
 
 f_limpiar_trade() =>
@@ -319,25 +271,26 @@ f_limpiar_trade() =>
 
 if buy_trigger
     f_limpiar_trade()
-    entry = close
-    sl    = entry - sl_points
-    tp1   = entry + (sl_points * tp1_ratio)
-    tp2   = entry + (sl_points * tp2_ratio)
-    tp3   = entry + (sl_points * tp3_ratio)
+    entry        = close
+    breaker_lvl  = high[1] // Nivel morado exacto
+    sl           = entry - sl_points
+    tp1          = entry + (sl_points * tp1_ratio)
+    tp2          = entry + (sl_points * tp2_ratio)
+    tp3          = entry + (sl_points * tp3_ratio)
 
     if mostrar_plan
-        // Botón Verde COMPRA con Precio
+        // Botón Morado de COMPRA con Precio
         lb_trade_main    := label.new(bar_index, low - (atr_val * 0.35), "COMPRA\n" + str.tostring(entry, "#.#"),
-                                      color=color.rgb(0, 168, 89), textcolor=color.white, style=label.style_label_up, size=size.normal)
+                                      color=color.rgb(155, 38, 206), textcolor=color.white, style=label.style_label_up, size=size.normal)
 
-        // Línea Morada de Retesteo (Breaker / Limit Entry) — discontinua fina
-        ln_retest_purple := line.new(bar_index, high[1], bar_index + proj_bars, high[1], color=color.new(color.purple, 20), width=1, style=line.style_dashed)
+        // Línea Morada de Retesteo (Breaker Level)
+        ln_retest_purple := line.new(bar_index, breaker_lvl, bar_index + proj_bars, breaker_lvl, color=color.purple, width=2, style=line.style_solid)
 
-        // Nivel SL (solido grueso: es lo critico)
+        // Nivel SL (Sólido grueso)
         ln_sl       := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
         lb_trade_sl := label.new(bar_index, sl, "SL " + str.tostring(sl, "#.#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
 
-        // Niveles TP (discontinuos finos)
+        // Niveles TP
         ln_tp1 := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.rgb(0, 200, 115), width=1, style=line.style_dashed)
         lb_tp1 := label.new(bar_index + proj_bars, tp1, "TP1 " + str.tostring(tp1, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
 
@@ -347,31 +300,32 @@ if buy_trigger
         ln_tp3 := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.rgb(0, 200, 115), width=1, style=line.style_dashed)
         lb_tp3 := label.new(bar_index + proj_bars, tp3, "TP3 " + str.tostring(tp3, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
 
-    // Alerta JSON para el bot (arreglo 5, sin efecto visual; JSON por
-    // concatenacion porque str.format interpreta las llaves como placeholders)
-    alert('{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + ',"tf":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+    // Alerta JSON Completa con breakerLevel incluido
+    json_buy = '{"action":"BUY","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, "#.##") + ',"breakerLevel":' + str.tostring(breaker_lvl, "#.##") + ',"sl":' + str.tostring(sl, "#.##") + ',"tp1":' + str.tostring(tp1, "#.##") + ',"tp2":' + str.tostring(tp2, "#.##") + ',"tp3":' + str.tostring(tp3, "#.##") + ',"tf":"' + timeframe.period + '"}'
+    alert(json_buy, alert.freq_once_per_bar_close)
 
 if sell_trigger
     f_limpiar_trade()
-    entry = close
-    sl    = entry + sl_points
-    tp1   = entry - (sl_points * tp1_ratio)
-    tp2   = entry - (sl_points * tp2_ratio)
-    tp3   = entry - (sl_points * tp3_ratio)
+    entry        = close
+    breaker_lvl  = low[1] // Nivel morado exacto
+    sl           = entry + sl_points
+    tp1          = entry - (sl_points * tp1_ratio)
+    tp2          = entry - (sl_points * tp2_ratio)
+    tp3          = entry - (sl_points * tp3_ratio)
 
     if mostrar_plan
-        // Botón Rojo VENTA con Precio
+        // Botón Rojo de VENTA con Precio
         lb_trade_main    := label.new(bar_index, high + (atr_val * 0.35), "VENTA\n" + str.tostring(entry, "#.#"),
                                       color=color.rgb(235, 47, 65), textcolor=color.white, style=label.style_label_down, size=size.normal)
 
-        // Línea Morada de Retesteo (Breaker / Limit Entry) — discontinua fina
-        ln_retest_purple := line.new(bar_index, low[1], bar_index + proj_bars, low[1], color=color.new(color.purple, 20), width=1, style=line.style_dashed)
+        // Línea Morada de Retesteo (Breaker Level)
+        ln_retest_purple := line.new(bar_index, breaker_lvl, bar_index + proj_bars, breaker_lvl, color=color.purple, width=2, style=line.style_solid)
 
-        // Nivel SL (solido grueso: es lo critico)
+        // Nivel SL (Sólido grueso)
         ln_sl       := line.new(bar_index, sl, bar_index + proj_bars, sl, color=color.red, width=2)
         lb_trade_sl := label.new(bar_index, sl, "SL " + str.tostring(sl, "#.#"), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.small)
 
-        // Niveles TP (discontinuos finos)
+        // Niveles TP
         ln_tp1 := line.new(bar_index, tp1, bar_index + proj_bars, tp1, color=color.rgb(0, 200, 115), width=1, style=line.style_dashed)
         lb_tp1 := label.new(bar_index + proj_bars, tp1, "TP1 " + str.tostring(tp1, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
 
@@ -381,11 +335,11 @@ if sell_trigger
         ln_tp3 := line.new(bar_index, tp3, bar_index + proj_bars, tp3, color=color.rgb(0, 200, 115), width=1, style=line.style_dashed)
         lb_tp3 := label.new(bar_index + proj_bars, tp3, "TP3 " + str.tostring(tp3, "#.#"), color=color.rgb(0, 200, 115), textcolor=color.white, style=label.style_label_left, size=size.small)
 
-    // Alerta JSON para el bot (arreglo 5, sin efecto visual; JSON por
-    // concatenacion porque str.format interpreta las llaves como placeholders)
-    alert('{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, format.mintick) + ',"sl":' + str.tostring(sl, format.mintick) + ',"tp1":' + str.tostring(tp1, format.mintick) + ',"tp2":' + str.tostring(tp2, format.mintick) + ',"tp3":' + str.tostring(tp3, format.mintick) + ',"tf":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+    // Alerta JSON Completa con breakerLevel incluido
+    json_sell = '{"action":"SELL","symbol":"' + syminfo.ticker + '","price":' + str.tostring(entry, "#.##") + ',"breakerLevel":' + str.tostring(breaker_lvl, "#.##") + ',"sl":' + str.tostring(sl, "#.##") + ',"tp1":' + str.tostring(tp1, "#.##") + ',"tp2":' + str.tostring(tp2, "#.##") + ',"tp3":' + str.tostring(tp3, "#.##") + ',"tf":"' + timeframe.period + '"}'
+    alert(json_sell, alert.freq_once_per_bar_close)
 
-// --- LIMPIEZA SI SE DESACTIVA UNA CAPA (arreglo 7: apagar = desaparecer) ---
+// Limpieza dinámica si se apagan módulos
 if not mostrar_plan
     f_limpiar_trade()
 if not mostrar_sw
@@ -397,7 +351,3 @@ if not mostrar_pdz
     label.delete(lb_prem)
     label.delete(lb_eq)
     label.delete(lb_disc)
-
-// --- ALERTAS SIMPLES (alternativa sin JSON: condición por señal) ---
-alertcondition(buy_trigger, "ZARUS30 BUY", "ZARUS30 BUY {{ticker}} @ {{close}} (senal al cierre de vela)")
-alertcondition(sell_trigger, "ZARUS30 SELL", "ZARUS30 SELL {{ticker}} @ {{close}} (senal al cierre de vela)")
