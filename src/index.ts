@@ -23,6 +23,19 @@ async function main() {
   // Mantenimiento continuo: settlement de decisiones + triage de errores
   startAgentMaintenance();
 
+  // ── ARNÉS (migración PROYECTO → ARNÉS): montar el chaleco AGENTE-GENERAL ──
+  // Best-effort: si algo falla, el bot arranca IGUAL que antes de la migración
+  // (el arnés es aditivo y NUNCA bloquea el arranque — migration-analysis.md §4).
+  try {
+    const { ensureHarness } = await import("./lib/harness/runtime.js");
+    const h = await ensureHarness();
+    console.log(
+      `[Boot] 🦺 Arnés montado: ${h.agent.name} v${h.agent.version} · bridges [${h.bridges.list().map((b) => b.type).join(", ")}] · conocimiento [${h.knowledge.list().map((k) => k.id).join(", ")}]`
+    );
+  } catch (err) {
+    console.warn(`[Boot] ⚠️ Arnés no montado (no bloquea el arranque): ${(err as Error).message}`);
+  }
+
   // Start Web Dashboard
   startDashboard(process.env.PORT ? parseInt(process.env.PORT) : 4000);
   

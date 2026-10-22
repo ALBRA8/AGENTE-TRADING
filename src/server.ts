@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "url";
 import { runAgentLoop } from "./agent/loop.js";
 import db, { getRecentMessages } from "./database/sqlite.js";
+import { ensureHarness } from "./lib/harness/runtime.js";
 import { getAgentStatusAsync } from "./agent/observability.js";
 import { evaluateBrain, getBrainTrend } from "./agent/brain_eval.js";
 import { runSettlement, startAgentMaintenance } from "./agent/settlement.js";
@@ -339,6 +340,81 @@ export function startDashboard(port: number = 3000) {
       res.json({ skills: getSkillsRegistry(), markdown: renderSkillsMarkdown() });
     } catch (error) {
       fail(res, "skills", error);
+    }
+  });
+
+  // ── ARNÉS (migración PROYECTO → ARNÉS): AGENTE-GENERAL + registries ──
+  // GET: lectura del arnés (bridges/skills/knowledge + salud). Público como
+  // el resto de GET: no expone secretos (tokens jamás en la respuesta).
+  app.get("/api/harness", async (_req, res) => {
+    try {
+      const h = await ensureHarness();
+      res.json({
+        agent: { id: h.agent.id, name: h.agent.name, version: h.agent.version, capabilities: h.agent.capabilities.map((c) => c.operation) },
+        bridges: h.bridges.list(),
+        skills: h.skills.list(),
+        knowledge: { modules: h.knowledge.list(), health: h.knowledge.healthCheck() },
+        config: { projectName: h.config.projectName, stack: h.config.stack, environment: h.config.environment },
+      });
+    } catch (error) {
+      fail(res, "harness GET", error);
+    }
+  });
+
+  // Salud detallada de cada bridge (¿NIM ok? ¿MT5 alcanzable? ¿Telegram listo?).
+  app.get("/api/harness/health", async (_req, res) => {
+    try {
+      const h = await ensureHarness();
+      const agent = await h.agent.healthCheck();
+      res.json({ agent, bridges: await h.bridges.healthAll() });
+    } catch (error) {
+      fail(res, "harness/health", error);
+    }
+  });
+
+  // POST: operaciones del arnés (chat vía AGENTE-GENERAL, execute-skill,
+  // knowledge…). Patrón fail-closed de /api/policy: SIN DASHBOARD_TOKEN
+  // configurado el control queda CERRADO (503) — nunca inferir autorización.
+  app.post("/api/harness", async (req, res) => {
+    try {
+      const token = process.env.DASHBOARD_TOKEN;
+      const auth = req.headers.authorization ?? "";
+      if (!token || auth !== `Bearer ${token}`) {
+        return res.status(503).json({
+          error: "Operaciones del arnés deshabilitadas: exporta DASHBOARD_TOKEN para operar (fail-closed, igual que /api/policy).",
+        });
+      }
+      const { operation, params } = req.body ?? {};
+      const h = await ensureHarness();
+      const p = (params ?? {}) as Record<string, unknown>;
+      switch (String(operation ?? "")) {
+        case "agent-execute": {
+          const op = String(p.operation ?? "");
+          if (!h.agent.canHandle(op)) {
+            return res.status(400).json({ error: `Operación no soportada por ${h.agent.name}: ${op}` });
+          }
+          return res.json(await h.agent.execute(op, (p.params ?? {}) as Record<string, unknown>));
+        }
+        case "execute-skill":
+          return res.json(
+            await h.skills.execute(String(p.skillId ?? ""), String(p.operation ?? ""), {
+              bridges: h.bridges,
+              knowledge: h.knowledge,
+              agent: h.agent,
+              params: (p.params ?? {}) as Record<string, unknown>,
+            })
+          );
+        case "agent-health":
+          return res.json(await h.agent.healthCheck());
+        case "knowledge-health":
+          return res.json(h.knowledge.healthCheck());
+        default:
+          return res.status(400).json({
+            error: "operation inválida: agent-execute | execute-skill | agent-health | knowledge-health",
+          });
+      }
+    } catch (error) {
+      fail(res, "harness POST", error);
     }
   });
 
