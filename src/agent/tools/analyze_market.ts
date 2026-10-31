@@ -92,7 +92,7 @@ export const analyzeMarket: Tool = {
         `No se puede analizar la estructura de ${symbol} con datos reales, así que este reporte NO sugiere ejecución.`,
         `El pipeline tratará el precio/estructura como UNKNOWN y bloqueará EXECUTE (fail-closed).`,
         isBridgeIssue
-          ? `_Verifica que MT5 esté abierto y bridge.py corriendo en localhost:5001._`
+          ? `_Verifica que MT5 esté abierto y bridge.py corriendo en localhost:29413._`
           : `_Datos insuficientes del feed: no se simulan ni se rellenan._`,
       ].join("\n");
     }

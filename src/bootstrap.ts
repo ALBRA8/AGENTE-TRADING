@@ -37,7 +37,7 @@ export const DEFAULT_HARNESS_CONFIG: ProjectConfig = {
   bridges: [
     { type: "nim", enabled: true }, // LLM real (integrate.api.nvidia.com)
     { type: "zai-sdk", enabled: true }, // fallback (no instalado → isAvailable false)
-    { type: "mt5", enabled: true }, // Flask local :5001
+    { type: "mt5", enabled: true }, // Flask local :29413
     { type: "telegram", enabled: true }, // notify saliente
     { type: "python", enabled: false }, // utilidades futuras (off por defecto)
   ],

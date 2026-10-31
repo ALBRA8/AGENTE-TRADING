@@ -38,7 +38,7 @@ export function classifyError(toolName: string, err: Error): {
   const msg = (err.message || "").toLowerCase();
   let errorType = "unknown";
 
-  if (msg.includes("bridge") || msg.includes("econnrefused") || msg.includes("5001")) {
+  if (msg.includes("bridge") || msg.includes("econnrefused") || msg.includes("5001") || msg.includes("29413")) {
     errorType = "bridge_down";
   } else if (msg.includes("timeout") || msg.includes("etimedout")) {
     errorType = "api_timeout";

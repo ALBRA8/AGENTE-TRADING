@@ -1,12 +1,24 @@
 ================================================================
-  AGENTE TRADING - ARRANQUE CON DOBLE CLIC
+  AGENTE TRADING - DESPLIEGUE RAPIDO CON DOBLE CLIC
 ================================================================
 
 COMO SE USA (lo unico que tienes que saber):
 
-  1-INICIAR-AGENTE.bat      DOBLE CLIC y listo. Arranca el Bridge
-                            MT5 + el Bot con el Dashboard y te abre
-                            el navegador en http://127.0.0.1:4000
+  INICIAR-AGENTE.vbs        EL NUEVO DOBLE CLIC UNICO. Si ya esta
+                            todo instalado, arranca el agente sin
+                            ver ninguna ventana y te abre el
+                            navegador en el dashboard cuando
+                            responde. Si es la primera vez, abre
+                            el instalador automaticamente.
+
+  INSTALAR-AGENTE.bat       Asistente de PRIMERA VEZ (lo abre el
+                            .vbs solo si falta algo). Crea tu .env
+                            preguntandote las claves, instala
+                            dependencias, compila y arranca.
+                            No hace falta usarlo mas veces.
+
+  1-INICIAR-AGENTE.bat      Arranque clasico con ventana visible
+                            (es lo que ejecuta el .vbs por dentro).
 
   2-ESTADO-AGENTE.bat       Doble clic para ver si todo esta vivo
                             y abrir la carpeta de logs.
@@ -18,12 +30,25 @@ COMO SE USA (lo unico que tienes que saber):
                             enciendas el PC (silencioso, sin
                             navegador). Para deshacerlo: el numero 5.
 
+PUERTOS (cambiados a proposito a puertos no tradicionales):
+
+  Dashboard + Bot : http://127.0.0.1:6879   (antes 4000)
+  Bridge MT5      : http://127.0.0.1:29413  (antes 5001)
+
+  Nada de 3000, 8000, 4000 ni 5001: asi los escaneos automaticos
+  de localhost no se encuentran nada conocido. Los dos puertos se
+  definen en 1-INICIAR-AGENTE.bat (DASH_PORT y BRIDGE_PORT) y
+  bridge.py lee la misma variable BRIDGE_PORT. En la primera
+  arrancada tras la actualizacion, el kit Viejo que quedara
+  escuchando en 4000/5001 se detiene solo (migracion automatica).
+
 QUE HACE EL INICIADOR POR TI:
 
-  - Comprueba que existe .env (si falta, te avisa)
+  - Comprueba que existe .env (si falta, abre el instalador)
   - Si es la primera vez, instala las dependencias (npm install)
   - Comprueba si MT5 esta abierto (si no, avisa pero arranca igual)
   - Comprueba si el Bridge o el Bot ya estaban corriendo (no duplica)
+  - Detiene restos del kit viejo en los puertos 4000/5001 (migracion)
   - Comprueba si hay novedades en GitHub y se actualiza solo
     (despliegue automatico; se desactiva con NO_ACTUALIZAR.txt)
   - Deja dos consolas minimizadas en la barra de tareas:
@@ -31,12 +56,13 @@ QUE HACE EL INICIADOR POR TI:
         AGT-Bot     -> logs\bot.log
   - Registra cada arranque en logs\arranque.log
 
-DESPLIEGUE AUTOMATICO (lo nuevo):
+DESPLIEGUE AUTOMATICO:
 
-  Cada vez que haces doble clic en 1-INICIAR-AGENTE.bat, el agente
-  comprueba GitHub y, si hay novedades, se las instala SOLO antes
-  de arrancar (y actualiza dependencias si hace falta). No pide
-  claves ni abre terminal: el repositorio es publico.
+  Cada vez que arrancas (con INICIAR-AGENTE.vbs o con
+  1-INICIAR-AGENTE.bat), el agente comprueba GitHub y, si hay
+  novedades, se las instala SOLO antes de arrancar (y actualiza
+  dependencias si hace falta). No pide claves ni abre terminal:
+  el repositorio es publico.
 
   - Sin internet: arranca con tu version local y te avisa.
   - Si tienes cambios propios sin subir: arranca con tu version

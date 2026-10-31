@@ -21,7 +21,10 @@
 
 import { assertOrderAllowed, type GuardCheck } from "../agent/execution_guard.js";
 
-const MT5_BRIDGE_URL = process.env.MT5_BRIDGE_URL ?? "http://localhost:5001";
+// Puerto no tradicional a propósito (29413; antes 5001). El lanzador exporta
+// BRIDGE_PORT y bridge.py lee la misma variable: una sola fuente de verdad.
+const MT5_BRIDGE_URL =
+  process.env.MT5_BRIDGE_URL ?? `http://localhost:${process.env.BRIDGE_PORT ?? "29413"}`;
 const BRIDGE_TIMEOUT_MS = (() => {
   const v = parseInt(process.env.BRIDGE_TIMEOUT_MS ?? "", 10);
   return Number.isFinite(v) && v > 0 ? v : 5000;

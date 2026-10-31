@@ -13,7 +13,8 @@ REQUISITOS:
 USO:
   python bridge.py
 
-El servidor escucha en http://localhost:5001
+El servidor escucha en http://localhost:29413 (puerto no tradicional a
+propósito; configurable con la variable de entorno BRIDGE_PORT).
 ================================================================
 """
 
@@ -43,7 +44,10 @@ except ImportError:
     sys.exit(1)
 
 # ── Configuración ─────────────────────────────────────────────
-BRIDGE_PORT = 5001
+# Puerto no tradicional a propósito (29413; antes 5001) para que escaneos
+# automáticos de localhost no lo encuentren. El lanzador 1-INICIAR-AGENTE.bat
+# exporta la misma variable: una sola fuente de verdad.
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT") or 29413)
 LOG_LEVEL   = logging.INFO
 
 logging.basicConfig(

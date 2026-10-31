@@ -21,7 +21,7 @@ type Mt5Module = typeof import("../../config/mt5bridge.js");
 
 export class Mt5Bridge implements IBridge {
   readonly type = "mt5";
-  readonly name = "MetaTrader 5 Bridge (Flask local :5001)";
+  readonly name = `MetaTrader 5 Bridge (Flask local :${process.env.BRIDGE_PORT ?? "29413"})`;
   private mod: Mt5Module | null = null;
 
   async isAvailable(): Promise<boolean> {
@@ -109,7 +109,7 @@ export class Mt5Bridge implements IBridge {
     return {
       available,
       latency: Date.now() - t0,
-      details: { type: this.type, url: process.env.MT5_BRIDGE_URL ?? "http://localhost:5001" },
+      details: { type: this.type, url: process.env.MT5_BRIDGE_URL ?? `http://localhost:${process.env.BRIDGE_PORT ?? "29413"}` },
     };
   }
 }

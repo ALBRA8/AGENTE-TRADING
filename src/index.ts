@@ -36,8 +36,10 @@ async function main() {
     console.warn(`[Boot] ⚠️ Arnés no montado (no bloquea el arranque): ${(err as Error).message}`);
   }
 
-  // Start Web Dashboard
-  startDashboard(process.env.PORT ? parseInt(process.env.PORT) : 4000);
+  // Start Web Dashboard — puerto no tradicional a propósito (6879; antes 4000).
+  // El lanzador 1-INICIAR-AGENTE.bat exporta DASH_PORT; PORT se mantiene
+  // como alias de compatibilidad.
+  startDashboard(parseInt(process.env.DASH_PORT ?? process.env.PORT ?? "6879", 10));
   
   console.log("[Boot] 🤖 Starting Telegram bot (Long Polling)…");
 

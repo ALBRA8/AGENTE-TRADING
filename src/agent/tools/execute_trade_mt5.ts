@@ -360,7 +360,7 @@ export const executeTradeMT5: Tool = {
     const isAlive = await MT5Bridge.health();
     if (!isAlive) {
       if (gatedDecisionId) releaseDecision(gatedDecisionId);
-      return `❌ **MT5 Bridge no disponible.**\n- Asegúrate de que MT5 esté abierto.\n- Ejecuta en tu terminal: \`python bridge.py\`\n- Verifica que esté escuchando en http://localhost:5001`;
+      return `❌ **MT5 Bridge no disponible.**\n- Asegúrate de que MT5 esté abierto.\n- Ejecuta en tu terminal: \`python bridge.py\`\n- Verifica que esté escuchando en http://localhost:29413`;
     }
 
     try {

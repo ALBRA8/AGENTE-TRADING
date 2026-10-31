@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 rem ================================================================
 rem  1-INICIAR-AGENTE.bat - ARRANQUE CON DOBLE CLIC
-rem  Inicia Bridge MT5 (puerto 5001) + Bot con Dashboard (puerto 4000)
+rem  Inicia Bridge MT5 (puerto 29413) + Bot con Dashboard (puerto 6879)
 rem  en ventanas minimizadas, con logs en la carpeta logs\.
 rem  No hace falta abrir PowerShell ni escribir nada.
 rem
@@ -19,8 +19,10 @@ rem ================================================================
 if not defined SILENCIOSO set SILENCIOSO=0
 if not defined ABRIR_DASH set ABRIR_DASH=1
 
-set BRIDGE_PORT=5001
-set DASH_PORT=4000
+rem  Puertos NO tradicionales a proposito: 6879 y 29413. Nada de 3000,
+rem  8000 ni 5001 para que escaneos automaticos de localhost no los toquen.
+set BRIDGE_PORT=29413
+set DASH_PORT=6879
 
 if not exist logs mkdir logs
 
@@ -81,6 +83,8 @@ if "%ACTUALIZAR%"=="1" if exist ".git" (
       ) else (
         echo [OK]   DESPLIEGUE AUTOMATICO: instalada la ultima version de GitHub.
         echo [%date% %time%] UPDATE: novedades descargadas desde GitHub >> logs\arranque.log
+        rem  Sin esto, un dist\ viejo seguiria corriendo con los puertos antiguos
+        if exist dist rmdir /s /q dist >nul 2>&1
         set FALTA_INSTALL=1
       )
     )
@@ -115,11 +119,21 @@ if "%MT5_OK%"=="0" (
 )
 
 rem --------------------------------------------------------------
-rem 3) Bridge MT5 (puerto 5001)
+rem 3) Bridge MT5 (puerto 29413)
 rem ------------------------------------------------------------
 rem Rotacion simple: si un log pasa de ~2 MB se guarda como .old
 for %%F in ("logs\bridge.log") do if %%~zF GTR 2000000 move /y logs\bridge.log logs\bridge.old >nul 2>&1
 for %%F in ("logs\bot.log") do if %%~zF GTR 2000000 move /y logs\bot.log logs\bot.old >nul 2>&1
+
+rem --------------------------------------------------------------
+rem  Migracion de puertos: si quedan restos del kit viejo escuchando
+rem  en 4000 o 5001, se detienen aqui para no duplicar el bot
+rem  (dos bots a la vez pelearian por el mismo Telegram).
+rem --------------------------------------------------------------
+call :port_up 4000
+if "%PORT_UP%"=="1" taskkill /F /PID %PORT_PID% >nul 2>&1
+call :port_up 5001
+if "%PORT_UP%"=="1" taskkill /F /PID %PORT_PID% >nul 2>&1
 
 set PY_CMD=python
 where python >nul 2>&1
@@ -148,7 +162,7 @@ exit /b 1
 echo [OK]   Bridge MT5 arriba (puerto %BRIDGE_PORT%).
 
 rem ------------------------------------------------------------
-rem 4) Bot + Dashboard (puerto 4000)
+rem 4) Bot + Dashboard (puerto 6879)
 rem ------------------------------------------------------------
 call :port_up %DASH_PORT%
 if "%PORT_UP%"=="1" goto bot_ok

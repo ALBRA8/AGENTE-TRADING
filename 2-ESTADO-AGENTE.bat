@@ -13,17 +13,17 @@ echo     AGENTE TRADING - ESTADO
 echo ============================================================
 echo.
 
-call :port_up 5001
+call :port_up 29413
 if "%PORT_UP%"=="1" (
-  echo   [OK]   Bridge MT5     : arriba  ^(puerto 5001, PID %PORT_PID%^)
+  echo   [OK]   Bridge MT5     : arriba  ^(puerto 29413, PID %PORT_PID%^)
 ) else (
   echo   [NO]   Bridge MT5     : PARADO  - ejecuta 1-INICIAR-AGENTE.bat
 )
 
-call :port_up 4000
+call :port_up 6879
 if "%PORT_UP%"=="1" (
-  echo   [OK]   Bot+Dashboard  : arriba  ^(puerto 4000, PID %PORT_PID%^)
-  echo          http://127.0.0.1:4000
+  echo   [OK]   Bot+Dashboard  : arriba  ^(puerto 6879, PID %PORT_PID%^)
+  echo          http://127.0.0.1:6879
 ) else (
   echo   [NO]   Bot+Dashboard  : PARADO  - ejecuta 1-INICIAR-AGENTE.bat
 )

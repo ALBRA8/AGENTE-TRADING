@@ -19,17 +19,17 @@ taskkill /F /T /FI "WINDOWTITLE eq AGT-Bot*" >nul 2>&1
 
 rem 2) Residuos: si el puerto sigue ocupado, mato ese PID concreto
 ping -n 3 127.0.0.1 >nul
-call :kill_port 5001
-call :kill_port 4000
+call :kill_port 29413
+call :kill_port 6879
 
 echo.
-call :port_up 5001
+call :port_up 29413
 if "%PORT_UP%"=="1" (
   echo   [NO] Bridge sigue arriba ^(algo externo lo mantiene^), PID %PORT_PID%
 ) else (
   echo   [OK] Bridge MT5 parado.
 )
-call :port_up 4000
+call :port_up 6879
 if "%PORT_UP%"=="1" (
   echo   [NO] Dashboard sigue arriba, PID %PORT_PID%
 ) else (

@@ -149,7 +149,7 @@ export async function runDoctor(): Promise<DoctorReport> {
       name: "bridge MT5 health",
       ok: false,
       severity: "warn",
-      detail: `bridge no responde en ${process.env.MT5_BRIDGE_URL ?? "http://localhost:5001"} (timeout 2.5s) — análisis fail-closed y sin ejecución`,
+      detail: `bridge no responde en ${process.env.MT5_BRIDGE_URL ?? `http://localhost:${process.env.BRIDGE_PORT ?? "29413"}`} (timeout 2.5s) — análisis fail-closed y sin ejecución`,
     });
   } else {
     mdChecks.push({ name: "bridge MT5 health", ok: true, detail: "health OK" });
