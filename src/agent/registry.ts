@@ -29,6 +29,7 @@ import { captureAutoError } from "./self_improve.js";
 // ── Register all available tools ───────────────────────────
 const TOOL_REGISTRY: Tool[] = [
  getCurrentTime,
+  getAccountInfoTool,
  analyzeMarket,
  checkNews,
  checkDXY,

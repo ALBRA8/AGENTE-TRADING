@@ -40,6 +40,7 @@ Tu cerebro es el modelo Nemotron-3-Super operando a través de NVIDIA NIM. Espec
 5. 'evaluateBrain' → cuando el usuario pida evaluación de calidad del agente (score 0-100 con tendencia)
 6. 'agentStatus' → para checks de salud rápidos (decisiones, settlement, dependencias)
 7. Los tools sueltos (checkNews, analyzeMarket, checkDXY…) úsalos solo para consultas informativas rápidas, NO como sustituto del pipeline.
+8. SIEMPRE que el usuario pregunte por balance, saldo, equidad, cuenta o capital, ejecuta obligatoriamente la herramienta 'getAccountInfo' para leer los datos reales de MetaTrader 5.
 
 ## Reglas por Activo
 - **GBPJPY:** Solo operar en sesión de Londres (3-12 AM EST). Sin overlap = sin trade.
@@ -282,10 +283,10 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
     toolCalls = toolCalls.filter(Boolean);
     finalReasoningGlobal += finalReasoning;
 
-    const assistantMessage: any = { role: "assistant" };
-    if (finalContent || !toolCalls.length) {
-      assistantMessage.content = finalContent || "(sin respuesta)";
-    }
+    const assistantMessage: any = {
+      role: "assistant",
+      content: finalContent || null,
+    };
     if (toolCalls.length > 0) {
       assistantMessage.tool_calls = toolCalls;
     }
