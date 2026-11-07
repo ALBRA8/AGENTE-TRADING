@@ -59,6 +59,14 @@ log = logging.getLogger("mt5-bridge")
 
 app = Flask(__name__)
 
+@app.before_request
+def ensure_connection():
+    try:
+        if not mt5.terminal_info():
+            init_mt5()
+    except Exception:
+        pass
+
 # ── Inicializar MT5 ───────────────────────────────────────────
 def init_mt5():
     try:
