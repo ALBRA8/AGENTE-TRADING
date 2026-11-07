@@ -23,6 +23,7 @@ import { evaluateBrainTool } from "./tools/evaluate_brain.js";
 import { agentStatusTool } from "./tools/agent_status.js";
 import { doctorStatusTool } from "./tools/doctor_status.js";
 import { runStrategyEngineTool } from "./tools/run_strategy_engine.js";
+import { getAccountInfoTool } from "./tools/get_account_info.js";
 import { captureAutoError } from "./self_improve.js";
 
 // ── Register all available tools ───────────────────────────
