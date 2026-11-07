@@ -12,12 +12,12 @@ dotenv.config({ override: true }); // override: la key del .env siempre gana sob
 export const NVIDIA_CONFIG = {
   baseURL: "https://integrate.api.nvidia.com/v1",
   // ── Modelo activo ─────────────────────────────────────────
-  model: "nvidia/nemotron-3-super-120b-a12b",
-  embeddingModel: "nvidia/nv-embedqa-e5-v5",
+  model: process.env.NVIDIA_MODEL || "z-ai/glm-5.3-flash",
+  embeddingModel: "nvidia/nv-embedqa-mistral-7b-v2",
   contextWindow: 128_000,
   maxTokens: 8_192,
-  temperature: 0.6,
-  topP: 0.7,
+  temperature: 0.5,
+  topP: 1.0,
 
   // Retry policy – exponential back-off
   retry: {

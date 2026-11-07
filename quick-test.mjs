@@ -17,19 +17,19 @@ console.log(`🔑 Key del .env: ${apiKey.slice(0,10)}...${apiKey.slice(-8)} (${a
 const client = new OpenAI({
   baseURL: "https://integrate.api.nvidia.com/v1",
   apiKey,
-  timeout: 30_000,
-  maxRetries: 0,
+  timeout: 90_000,
+  maxRetries: 2,
 });
 
-console.log("🧪 Probando moonshotai/kimi-k2.5...");
+console.log("🧪 Probando z-ai/glm-5.3-flash...");
 try {
   const res = await client.chat.completions.create({
-    model: "moonshotai/kimi-k2.5",
+    model: env.NVIDIA_MODEL || "z-ai/glm-5.3-flash",
     messages: [{ role: "user", content: "Responde solo con: FUNCIONA" }],
     max_tokens: 16,
     temperature: 0,
   });
-  console.log(`✅ Kimi K2.5 responde: "${res.choices[0].message.content}"`);
+  console.log(`✅ GLM-5.3-flash responde: "${res.choices[0].message.content}"`);
   console.log(`   Finish reason: ${res.choices[0].finish_reason}`);
   console.log(`   Tokens: ${res.usage?.total_tokens}`);
 } catch (err) {
