@@ -102,7 +102,7 @@ if "%FALTA_INSTALL%"=="1" (
 
 set RUN_CMD=node dist\index.js
 if not exist "dist\index.js" (
-  echo [INFO] No hay build (dist\): arranco con tsx en directo.
+  echo [INFO] No hay build dist: arranco con tsx en directo.
   set RUN_CMD=npx tsx src\index.ts
 )
 
@@ -114,7 +114,7 @@ tasklist /FI "IMAGENAME eq terminal64.exe" 2>nul | find /I "terminal64.exe" >nul
 if not errorlevel 1 set MT5_OK=1
 if "%MT5_OK%"=="0" (
   echo [AVISO] MetaTrader 5 NO esta abierto.
-  echo         El agente arranca igual (PAPER), pero el bridge no podra
+  echo         El agente arranca igual modo PAPER, pero el bridge no podra
   echo         hablar con MT5 hasta que abras el terminal.
 )
 
@@ -144,14 +144,20 @@ if "%PORT_UP%"=="1" goto bridge_ok
 
 echo [....] Iniciando Bridge MT5 (puerto %BRIDGE_PORT%)...
 start "AGT-Bridge" /min cmd /c "%PY_CMD% bridge.py >> logs\bridge.log 2>&1"
-ping -n 5 127.0.0.1 >nul
+set WAIT_B=0
+:wait_b_loop
 call :port_up %BRIDGE_PORT%
 if "%PORT_UP%"=="1" goto bridge_ok
+set /a WAIT_B+=1
+if %WAIT_B% GTR 10 goto bridge_fail
+ping -n 2 127.0.0.1 >nul
+goto wait_b_loop
 
+:bridge_fail
 echo [FALLO] El Bridge no respondio en el puerto %BRIDGE_PORT%.
 echo         Ultimas lineas de logs\bridge.log:
 echo         --------------------------------------------------
-if exist logs\bridge.log (type logs\bridge.log) else echo         (log vacio o inexistente)
+if exist logs\bridge.log (type logs\bridge.log) else echo         log vacio o inexistente
 echo [%date% %time%] FALLO: bridge no arranco >> logs\arranque.log
 echo         --------------------------------------------------
 if "%SILENCIOSO%"=="1" exit /b 1
@@ -169,14 +175,20 @@ if "%PORT_UP%"=="1" goto bot_ok
 
 echo [....] Iniciando Bot + Dashboard (puerto %DASH_PORT%)...
 start "AGT-Bot" /min cmd /c "%RUN_CMD% >> logs\bot.log 2>&1"
-ping -n 7 127.0.0.1 >nul
+set WAIT_D=0
+:wait_d_loop
 call :port_up %DASH_PORT%
 if "%PORT_UP%"=="1" goto bot_ok
+set /a WAIT_D+=1
+if %WAIT_D% GTR 15 goto bot_fail
+ping -n 2 127.0.0.1 >nul
+goto wait_d_loop
 
+:bot_fail
 echo [FALLO] El Bot/Dashboard no respondio en el puerto %DASH_PORT%.
 echo         Ultimas lineas de logs\bot.log:
 echo         --------------------------------------------------
-if exist logs\bot.log (type logs\bot.log) else echo         (log vacio o inexistente)
+if exist logs\bot.log (type logs\bot.log) else echo         log vacio o inexistente
 echo [%date% %time%] FALLO: bot no arranco >> logs\arranque.log
 echo         --------------------------------------------------
 if "%SILENCIOSO%"=="1" exit /b 1
