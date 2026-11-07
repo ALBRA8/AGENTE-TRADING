@@ -89,19 +89,14 @@ function buildHistory(userId: string): ChatCompletionMessageParam[] {
   const messages: ChatCompletionMessageParam[] = [];
 
   for (const row of rows) {
-    if (row.role === "user") {
+    if (row.role === "user" && row.content) {
       messages.push({ role: "user", content: row.content });
-    } else if (row.role === "assistant") {
+    } else if (row.role === "assistant" && row.content) {
       messages.push({ role: "assistant", content: row.content });
-    } else if (row.role === "tool" && row.tool_call_id) {
-      const toolMsg: ChatCompletionToolMessageParam = {
-        role: "tool",
-        tool_call_id: row.tool_call_id,
-        content: row.content,
-      };
-      messages.push(toolMsg);
     }
-    // system messages from DB are intentionally omitted – we inject fresh ones
+    // Las filas 'tool' intermedias de turnos anteriores se omiten:
+    // OpenAI/NIM exige emparejamiento estricto assistant.tool_calls -> tool.
+    // La respuesta final del asistente ya contiene la información consolidada.
   }
 
   return messages;
@@ -227,6 +222,12 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
                 function: { name: tc.function?.name || "", arguments: "" },
               };
             }
+            if (tc.id && !toolCalls[tc.index].id) {
+              toolCalls[tc.index].id = tc.id;
+            }
+            if (tc.function?.name && !toolCalls[tc.index].function.name) {
+              toolCalls[tc.index].function.name = tc.function.name;
+            }
             if (tc.function?.arguments) {
               toolCalls[tc.index].function.arguments += tc.function.arguments;
             }
@@ -279,8 +280,13 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
       );
     }
 
-    // Clean up empty indexes from array
+    // Clean up empty indexes from array and normalize empty arguments to valid JSON object
     toolCalls = toolCalls.filter(Boolean);
+    for (const tc of toolCalls) {
+      if (tc?.function && (!tc.function.arguments || !tc.function.arguments.trim())) {
+        tc.function.arguments = "{}";
+      }
+    }
     finalReasoningGlobal += finalReasoning;
 
     const assistantMessage: any = {

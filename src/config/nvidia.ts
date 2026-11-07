@@ -28,7 +28,7 @@ export const NVIDIA_CONFIG = {
   //                        si el modelo abre el stream y luego se calla, se aborta.
   // Ajustables por .env sin tocar código.
   requestTimeoutMs: parseInt(process.env.LLM_TIMEOUT_MS ?? "", 10) || 30_000,
-  streamIdleTimeoutMs: parseInt(process.env.LLM_STREAM_IDLE_MS ?? "", 10) || 15_000,
+  streamIdleTimeoutMs: parseInt(process.env.LLM_STREAM_IDLE_MS ?? "", 10) || 30_000,
 
   // Retry policy – exponential back-off
   retry: {
