@@ -255,12 +255,15 @@ export class RegimeAnalyzer {
     }
 
     // Calcular probabilidades de transición
+    // (se saca a una constante local: el narrowing de this.currentRegime no
+    //  sobrevive dentro del closure del reduce y tsc lo marca como nullable)
+    const currentRegimeNow = this.currentRegime.regime;
     const transitions = this.regimeHistory.reduce((acc, state, i) => {
       if (i === 0) return acc;
       const prev = this.regimeHistory[i - 1].regime;
       const curr = state.regime;
       
-      if (prev === this.currentRegime.regime) {
+      if (prev === currentRegimeNow) {
         acc[curr] = (acc[curr] || 0) + 1;
       }
       return acc;

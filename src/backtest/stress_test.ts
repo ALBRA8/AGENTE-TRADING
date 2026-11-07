@@ -185,7 +185,7 @@ export class StressTestEngine {
     console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     console.log("📈 Análisis Final de Estrés\n");
     const summary = this.generateSummary(baseline, stressedResults);
-    const recommendations = this.generateRecommendations(summary, stressedResults);
+    const recommendations = this.generateRecommendations(baseline, summary, stressedResults);
 
     return {
       scenarios: allScenarios,
@@ -299,8 +299,10 @@ export class StressTestEngine {
     // Aplicar gap (si el trade estaba expuesto overnight)
     if (conditions.gapPercent && this.isOvernightTrade(trade)) {
       const gapImpact = trade.initialBalance * Math.abs(conditions.gapPercent);
-      // Gap contra la posición
-      const direction = trade.direction === "long" ? 1 : -1;
+      // Gap contra la posición (direction: LONG=+1, SHORT=-1 — el tipo real
+      // de Trade.direction es "LONG"|"SHORT"; antes se comparaba con "long"
+      // y TODOS los trades quedaban como short en este cálculo)
+      const direction = trade.direction === "LONG" ? 1 : -1;
       const gapAgainst = conditions.gapPercent * direction < 0;
       
       if (gapAgainst) {
@@ -527,6 +529,7 @@ export class StressTestEngine {
   }
 
   private generateRecommendations(
+    baseline: BacktestResult,
     summary: StressResult["summary"],
     stressed: Record<string, StressedResult>
   ): string[] {

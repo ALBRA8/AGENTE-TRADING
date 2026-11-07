@@ -132,74 +132,129 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
   let iterations = 0;
   let finalReasoningGlobal = "";
 
+  // ── Escudo anti-cuelgue (fix "Failed to fetch" en /api/chat/message) ──
+  // Si el modelo activo NO soporta tool-calling, NIM contesta 4xx hablando
+  // de tools/functions: se reintenta UNA sola vez sin tools (texto plano).
+  let toolsDisabled = false;
+
   // 3. Agent Loop
   for (let i = 0; i < maxIterations; i++) {
     iterations++;
 
-    const stream = await withRetry(
-      () =>
-        (nvidiaNIMClient.chat.completions.create as any)({
-          model: NVIDIA_CONFIG.model,
-          messages,
-          tools: tools.map((t: Tool) => t.definition),
-          tool_choice: "auto",
-          max_tokens: NVIDIA_CONFIG.maxTokens,
-          temperature: NVIDIA_CONFIG.temperature,
-          top_p: NVIDIA_CONFIG.topP,
-          stream: true,
-          ...(NVIDIA_CONFIG.model.includes('nemotron') ? {
-            extra_body: {
-              chat_template_kwargs: { enable_thinking: true },
-              reasoning_budget: 16384,
-            },
-          } : {}),
-        }),
-      `iteration ${i + 1}`
-    );
+    // ── Watchdog de inactividad (timeout defensivo, 15s por defecto) ──
+    // Cubre conexión + espera del primer chunk + silencios ENTRE chunks.
+    // Sin esto, un stream que abre y se calla deja el endpoint colgado.
+    const idleMs = NVIDIA_CONFIG.streamIdleTimeoutMs;
+    const controller = new AbortController();
+    let idleTimer: NodeJS.Timeout | null = null;
+    let timedOut = false;
+    const armWatchdog = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        try { controller.abort(); } catch { /* noop */ }
+      }, idleMs);
+    };
 
     let finalContent = "";
     let finalReasoning = "";
     let toolCalls: any[] = [];
     let finishReason: string | null = null;
 
-    for await (const chunk of (stream as any)) {
-      if (!chunk.choices || !chunk.choices[0]) continue;
-      
-      const delta = chunk.choices[0].delta as any;
-      if (!delta) continue;
+    try {
+      armWatchdog();
+      const stream = await withRetry(
+        () =>
+          (nvidiaNIMClient.chat.completions.create as any)({
+            model: NVIDIA_CONFIG.model,
+            messages,
+            ...(toolsDisabled
+              ? {}
+              : { tools: tools.map((t: Tool) => t.definition), tool_choice: "auto" }),
+            max_tokens: NVIDIA_CONFIG.maxTokens,
+            temperature: NVIDIA_CONFIG.temperature,
+            top_p: NVIDIA_CONFIG.topP,
+            stream: true,
+            signal: controller.signal,
+            ...(NVIDIA_CONFIG.model.includes("nemotron")
+              ? {
+                  extra_body: {
+                    chat_template_kwargs: { enable_thinking: true },
+                    reasoning_budget: 16384,
+                  },
+                }
+              : {}),
+          }),
+        `iteration ${i + 1}`
+      );
 
-      if (chunk.choices[0].finish_reason) {
-        finishReason = chunk.choices[0].finish_reason;
-      }
+      for await (const chunk of (stream as any)) {
+        armWatchdog(); // cada chunk re-arma el vigilante: solo la inactividad corta
+        if (!chunk.choices || !chunk.choices[0]) continue;
 
-      const rContent = delta.reasoning_content || "";
-      const content = delta.content || "";
+        const delta = chunk.choices[0].delta as any;
+        if (!delta) continue;
 
-      if (rContent) {
-        finalReasoning += rContent;
-        if (onStream) onStream(rContent, true);
-      }
-      if (content) {
-        finalContent += content;
-        if (onStream) onStream(content, false);
-      }
+        if (chunk.choices[0].finish_reason) {
+          finishReason = chunk.choices[0].finish_reason;
+        }
 
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          if (!toolCalls[tc.index]) {
-            toolCalls[tc.index] = {
-              id: tc.id || "",
-              type: "function",
-              function: { name: tc.function?.name || "", arguments: "" }
-            };
-          }
-          if (tc.function?.arguments) {
-            toolCalls[tc.index].function.arguments += tc.function.arguments;
+        const rContent = delta.reasoning_content || "";
+        const content = delta.content || "";
+
+        if (rContent) {
+          finalReasoning += rContent;
+          if (onStream) onStream(rContent, true);
+        }
+        if (content) {
+          finalContent += content;
+          if (onStream) onStream(content, false);
+        }
+
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (!toolCalls[tc.index]) {
+              toolCalls[tc.index] = {
+                id: tc.id || "",
+                type: "function",
+                function: { name: tc.function?.name || "", arguments: "" },
+              };
+            }
+            if (tc.function?.arguments) {
+              toolCalls[tc.index].function.arguments += tc.function.arguments;
+            }
           }
         }
       }
+    } catch (err) {
+      // 1) Timeout defensivo: si hubo contenido parcial se entrega; si no,
+      //    error CLARO para que el endpoint responda amigable.
+      if (timedOut) {
+        if (finalContent.trim()) {
+          const partial = finalContent.trim();
+          saveMessage(userId, "assistant", partial);
+          return { response: partial, reasoning: finalReasoningGlobal, iterations };
+        }
+        throw new Error(
+          `LLM_STREAM_TIMEOUT: ${NVIDIA_CONFIG.model} no envió datos en ` +
+            `${Math.round(idleMs / 1000)}s (timeout defensivo anti-cuelgue)`
+        );
+      }
+      // 2) Modelo sin soporte de tools → reintenta UNA vez sin tools.
+      const msg = (err as Error).message || "";
+      if (!toolsDisabled && /\b(400|404|422)\b/.test(msg) && /tool|function/i.test(msg)) {
+        toolsDisabled = true;
+        console.warn(
+          `[AgentLoop] ⚠️ El modelo ${NVIDIA_CONFIG.model} no soporta tools: ` +
+            `reintentando sin tools. (${msg.slice(0, 140)})`
+        );
+        i--; // repite esta misma iteración sin tools (el i++ del for re-alinea)
+        continue;
+      }
+      throw err;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
-
     // Clean up empty indexes from array
     toolCalls = toolCalls.filter(Boolean);
     finalReasoningGlobal += finalReasoning;

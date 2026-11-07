@@ -85,6 +85,15 @@ export interface Trade {
   setupType: string; // "BOS", "ChoCh", "FVG_CONFIRMED", etc.
   maxDrawdownPips: number; // Maximum adverse excursion during trade
   maxProfitPips: number; // Maximum favorable excursion during trade
+
+  // ── Campos planos derivados (los consumen portfolio / regime / stress) ──
+  // Rellenados por simulator.ts al abrir y al cerrar cada trade:
+  entryTime: Date;          // = entry.time (copia plana)
+  exitTime: Date;           // = exit.time (copia plana, se actualiza al cerrar)
+  netPnL: number;           // PnL NETO en moneda (= profit tras comisión)
+  grossPnL: number;         // PnL BRUTO en moneda (antes de comisión)
+  result: "win" | "loss" | "breakeven"; // según signo del netPnL final
+  initialBalance: number;   // balance de la cuenta en el momento de abrir
 }
 
 export interface BacktestConfig {

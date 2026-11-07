@@ -98,6 +98,10 @@ if "%FALTA_INSTALL%"=="1" (
     echo [AVISO] npm install devolvio error: revisa logs\install.log
     echo         El agente intenta arrancar igualmente.
   )
+  rem  tsc ya compila limpio: reconstruir dist\ tras cada actualizacion
+  echo [....] Compilando ^(npm run build^)...
+  call npm run build >> logs\install.log 2>&1
+  if errorlevel 1 echo [AVISO] build fallo: arrancara con tsx igualmente.
 )
 
 set RUN_CMD=node dist\index.js

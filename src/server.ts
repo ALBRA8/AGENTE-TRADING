@@ -294,7 +294,12 @@ export function startDashboard(port: number = 3000) {
     }
   });
 
-  // API: Send Message to Agent
+  // ── API: chat del dashboard ──
+  // Tanda 2 del escudo anti-cuelgue: este endpoint SIEMPRE contesta JSON a
+  // tiempo (200 con respuesta amigable) aunque el LLM tarde, falle o no
+  // soporte tools. El frontend (public/app.js) nunca vuelve a ver
+  // "Failed to fetch" por un modelo colgado.
+  const CHAT_TOTAL_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS ?? "", 10) || 60_000;
   app.post("/api/chat/message", async (req, res) => {
     const { message } = req.body;
 
@@ -302,14 +307,33 @@ export function startDashboard(port: number = 3000) {
       return res.status(400).json({ error: "Message is required" });
     }
 
+    // Techo TOTAL del turno (tanda 3): el watchdog del loop corta la espera
+    // por inactividad; este race corta aunque el loop siga iterando tools.
+    let totalTimer: NodeJS.Timeout | null = null;
+    const totalTimeout = new Promise<never>((_, reject) => {
+      totalTimer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `LLM_TOTAL_TIMEOUT: el agente tardó más de ${Math.round(CHAT_TOTAL_TIMEOUT_MS / 1000)}s en responder`
+            )
+          ),
+        CHAT_TOTAL_TIMEOUT_MS
+      );
+    });
+
     try {
-      const response = await runAgentLoop({
-        userId: "web_session",
-        userMessage: message,
-        onStream: (chunk, isReasoning) => {
-          // Future: could hook up WebSockets for live streaming
-        }
-      });
+      const response = await Promise.race([
+        runAgentLoop({
+          userId: "web_session",
+          userMessage: message,
+          onStream: (chunk, isReasoning) => {
+            // Future: could hook up WebSockets for live streaming
+          },
+        }),
+        totalTimeout,
+      ]);
+      if (totalTimer) clearTimeout(totalTimer);
 
       res.json({
         response: response.response,
@@ -317,8 +341,16 @@ export function startDashboard(port: number = 3000) {
       });
 
     } catch (error) {
-      // Log completo en servidor; al cliente solo un mensaje genérico.
-      fail(res, "chat/message", error);
+      if (totalTimer) clearTimeout(totalTimer);
+      // Fallback amigable: log completo en servidor; al cliente SIEMPRE un
+      // 200 con `response` (app.js lo pinta tal cual, sin "Failed to fetch").
+      const msg = (error as Error).message || "";
+      console.error("[chat/message] fallback amigable:", msg);
+
+      const friendly = msg.includes("TIMEOUT")
+        ? "🟡 El cerebro (LLM) está tardando demasiado y corté la espera para no dejarte colgado. Prueba de nuevo en unos segundos; si persiste, revisa la NVIDIA_API_KEY o cambia de modelo en .env."
+        : "🔴 El cerebro (LLM) no pudo responder en este momento. Revisa la conexión, la NVIDIA_API_KEY y el modelo configurado, e inténtalo otra vez. Detalle: " + msg.slice(0, 140);
+      res.json({ response: friendly });
     }
   });
 

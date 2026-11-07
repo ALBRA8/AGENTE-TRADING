@@ -275,6 +275,12 @@ export function simulateTrades(
         trade.maxProfitPips = tracker.maxProfit;
         trade.duration = barsSinceEntry; // en VELAS del timeframe simulado
 
+        // Campos planos derivados sincronizados con el cierre real
+        trade.exitTime = candleTime;
+        trade.netPnL = trade.profit;
+        trade.grossPnL = grossUsd;
+        trade.result = trade.profit > 0 ? "win" : trade.profit < 0 ? "loss" : "breakeven";
+
         currentBalance += trade.profit;
 
         // Quitar de activos
@@ -378,6 +384,13 @@ export function simulateTrades(
         setupType: setup.type + (setup.fvg ? "_FVG" : ""),
         maxDrawdownPips: 0,
         maxProfitPips: 0,
+        // Campos planos derivados (portfolio/regime/stress los leen)
+        entryTime: setup.time,
+        exitTime: candleTime, // placeholder; se actualiza al cerrar
+        netPnL: 0,
+        grossPnL: 0,
+        result: "breakeven",
+        initialBalance: currentBalance,
       };
 
       activeTrades.push(trade);
@@ -438,6 +451,12 @@ export function simulateTrades(
       const tracker = tradeTrackers.get(trade);
       trade.maxDrawdownPips = tracker?.maxDrawdown ?? 0;
       trade.maxProfitPips = tracker?.maxProfit ?? 0;
+
+      // Campos planos derivados sincronizados con el cierre forzado
+      trade.exitTime = lastCandle.time;
+      trade.netPnL = trade.profit;
+      trade.grossPnL = grossUsd;
+      trade.result = trade.profit > 0 ? "win" : trade.profit < 0 ? "loss" : "breakeven";
 
       currentBalance += trade.profit;
     }

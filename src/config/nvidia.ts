@@ -19,6 +19,15 @@ export const NVIDIA_CONFIG = {
   temperature: 0.5,
   topP: 1.0,
 
+  // ── Timeouts defensivos (estabilidad del frontend) ──
+  // Un modelo NIM que cuelga no puede dejar al usuario con "Failed to fetch".
+  //   requestTimeoutMs   → techo de una petición NO streaming (callLLMByTier, embeddings)
+  //   streamIdleTimeoutMs→ inactividad máxima ENTRE chunks en streaming (agent loop):
+  //                        si el modelo abre el stream y luego se calla, se aborta.
+  // Ajustables por .env sin tocar código.
+  requestTimeoutMs: parseInt(process.env.LLM_TIMEOUT_MS ?? "", 10) || 30_000,
+  streamIdleTimeoutMs: parseInt(process.env.LLM_STREAM_IDLE_MS ?? "", 10) || 15_000,
+
   // Retry policy – exponential back-off
   retry: {
     maxAttempts: 3,
@@ -193,7 +202,7 @@ export const nvidiaNIMClient = new OpenAI({
     "User-Agent": "TradingAgent/1.0 (Node.js; NVIDIA-NIM-Compatible)",
     Accept: "application/json",
   },
-  timeout: 90_000,   // 90 s – NIM can be slow on first call
+  timeout: NVIDIA_CONFIG.requestTimeoutMs, // 30 s por defecto (antes 90 s: con 3 reintentos eran ~4.5 min colgados)
   maxRetries: 0,     // We handle retries ourselves (exponential back-off)
 });
 
