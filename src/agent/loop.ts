@@ -165,26 +165,32 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
       armWatchdog();
       const stream = await withRetry(
         () =>
-          (nvidiaNIMClient.chat.completions.create as any)({
-            model: NVIDIA_CONFIG.model,
-            messages,
-            ...(toolsDisabled
-              ? {}
-              : { tools: tools.map((t: Tool) => t.definition), tool_choice: "auto" }),
-            max_tokens: NVIDIA_CONFIG.maxTokens,
-            temperature: NVIDIA_CONFIG.temperature,
-            top_p: NVIDIA_CONFIG.topP,
-            stream: true,
-            signal: controller.signal,
-            ...(NVIDIA_CONFIG.model.includes("nemotron")
-              ? {
-                  extra_body: {
-                    chat_template_kwargs: { enable_thinking: true },
-                    reasoning_budget: 16384,
-                  },
-                }
-              : {}),
-          }),
+          (nvidiaNIMClient.chat.completions.create as any)(
+            {
+              model: NVIDIA_CONFIG.model,
+              messages,
+              ...(toolsDisabled
+                ? {}
+                : { tools: tools.map((t: Tool) => t.definition), tool_choice: "auto" }),
+              max_tokens: NVIDIA_CONFIG.maxTokens,
+              temperature: NVIDIA_CONFIG.temperature,
+              top_p: NVIDIA_CONFIG.topP,
+              stream: true,
+              ...(NVIDIA_CONFIG.model.includes("nemotron")
+                ? {
+                    extra_body: {
+                      chat_template_kwargs: { enable_thinking: true },
+                      reasoning_budget: 16384,
+                    },
+                  }
+                : {}),
+            },
+            // ⚠️ El signal va en OPTIONS (2º argumento), NO en el body. El SDK
+            // openai v4 ignora un signal viajando dentro del body: el abort del
+            // watchdog nunca llegaría a la capa HTTP y el corte real tardaría
+            // requestTimeoutMs×reintentos en vez de streamIdleTimeoutMs.
+            { signal: controller.signal }
+          ),
         `iteration ${i + 1}`
       );
 
@@ -255,6 +261,23 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
     }
+
+    // Post-stream check: openai-node v4 puede manifestar el abort como un FIN
+    // LIMPIO del iterador (sin excepción), así que el flag timedOut manda
+    // también fuera del catch. Sin esto, un stream colgado devolvería
+    // "(sin respuesta)" en vez del error claro de timeout.
+    if (timedOut) {
+      if (finalContent.trim()) {
+        const partial = finalContent.trim();
+        saveMessage(userId, "assistant", partial);
+        return { response: partial, reasoning: finalReasoningGlobal, iterations };
+      }
+      throw new Error(
+        `LLM_STREAM_TIMEOUT: ${NVIDIA_CONFIG.model} no envió datos en ` +
+          `${Math.round(idleMs / 1000)}s (timeout defensivo anti-cuelgue)`
+      );
+    }
+
     // Clean up empty indexes from array
     toolCalls = toolCalls.filter(Boolean);
     finalReasoningGlobal += finalReasoning;

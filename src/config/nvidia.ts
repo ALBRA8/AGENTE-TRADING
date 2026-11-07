@@ -10,7 +10,9 @@ dotenv.config({ override: true }); // override: la key del .env siempre gana sob
 
 // ── Constants ─────────────────────────────────────────────
 export const NVIDIA_CONFIG = {
-  baseURL: "https://integrate.api.nvidia.com/v1",
+  // baseURL sobreescribible por .env (NVIDIA_BASE_URL) → permite apuntar a un
+  // NIM local/self-hosted o a un mock en tests sin tocar código.
+  baseURL: process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1",
   // ── Modelo activo ─────────────────────────────────────────
   model: process.env.NVIDIA_MODEL || "meta/llama-3.2-90b-vision-instruct",
   embeddingModel: "nvidia/nv-embedqa-mistral-7b-v2",
