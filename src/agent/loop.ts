@@ -147,10 +147,12 @@ export async function runAgentLoop(input: AgentInput): Promise<AgentOutput> {
           temperature: NVIDIA_CONFIG.temperature,
           top_p: NVIDIA_CONFIG.topP,
           stream: true,
-          extra_body: {
-            chat_template_kwargs: { enable_thinking: true },
-            reasoning_budget: 16384,
-          },
+          ...(NVIDIA_CONFIG.model.includes('nemotron') ? {
+            extra_body: {
+              chat_template_kwargs: { enable_thinking: true },
+              reasoning_budget: 16384,
+            },
+          } : {}),
         }),
       `iteration ${i + 1}`
     );
