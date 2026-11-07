@@ -61,13 +61,20 @@ app = Flask(__name__)
 
 # ── Inicializar MT5 ───────────────────────────────────────────
 def init_mt5():
-    if not mt5.initialize():
-        log.error(f"initialize() falló, código de error: {mt5.last_error()}")
+    try:
+        if not mt5.initialize():
+            log.warning(f"initialize() falló, código de error: {mt5.last_error()}")
+            return False
+        info = mt5.terminal_info()
+        account = mt5.account_info()
+        if account:
+            log.info(f"MT5 conectado: {info.name if info else 'MT5'} | Cuenta: {account.login} | Balance: {account.balance}")
+        else:
+            log.warning("MT5 terminal detectado pero la cuenta no está autorizada aún.")
+        return True
+    except Exception as e:
+        log.warning(f"Excepción en init_mt5: {e}")
         return False
-    info = mt5.terminal_info()
-    account = mt5.account_info()
-    log.info(f"MT5 conectado: {info.name} | Cuenta: {account.login} | Balance: {account.balance}")
-    return True
 
 # ── Mapeo de Timeframes ───────────────────────────────────────
 TIMEFRAME_MAP = {
@@ -872,8 +879,7 @@ if __name__ == "__main__":
     log.info("Iniciando MT5 Bridge...")
 
     if not init_mt5():
-        log.error("No se pudo conectar a MetaTrader 5. Asegúrate de que MT5 esté abierto.")
-        sys.exit(1)
+        log.warning("MT5 no conectado al iniciar (terminal cerrado o sin autorizar). El servidor HTTP seguirá activo para reintentar cuando abras MT5.")
 
     log.info(f"MT5 Bridge activo en http://localhost:{BRIDGE_PORT}")
     log.info("Endpoints disponibles:")
