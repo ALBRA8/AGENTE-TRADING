@@ -24,6 +24,7 @@ import { agentStatusTool } from "./tools/agent_status.js";
 import { doctorStatusTool } from "./tools/doctor_status.js";
 import { runStrategyEngineTool } from "./tools/run_strategy_engine.js";
 import { getAccountInfoTool } from "./tools/get_account_info.js";
+import { runTimeMachineTool } from "./tools/run_time_machine.js";
 import { captureAutoError } from "./self_improve.js";
 
 // ── Register all available tools ───────────────────────────
@@ -48,6 +49,7 @@ const TOOL_REGISTRY: Tool[] = [
  agentStatusTool,
  doctorStatusTool, // Task 10-c §20: doctor del agente (agrega checks existentes)
  runStrategyEngineTool, // STRATEGY ENGINE V1.0: tick determinista S0-S9 (spec §6)
+ runTimeMachineTool, // TIME MACHINE: odds honestas (Monte Carlo + replay histórico) del plan antes del comité
  // agrega más herramientas aquí conforme crece el agente
 ];
 
