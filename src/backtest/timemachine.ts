@@ -104,6 +104,14 @@ export interface TMVerdict {
 
 // ── 1. Agrupar velas cerradas en sesiones por día ──────────
 
+function parseCandleMs(timeStr: string): number {
+  if (!timeStr) return NaN;
+  const normalized = timeStr.includes("T") ? timeStr : timeStr.replace(" ", "T");
+  const withZ = /Z|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : normalized + "Z";
+  const ms = new Date(withZ).getTime();
+  return Number.isFinite(ms) ? ms : new Date(timeStr).getTime();
+}
+
 export function buildSessions(
   raw: TMRawCandle[],
   tfMinutes: number,
@@ -125,7 +133,7 @@ export function buildSessions(
   let excluded = false;
   let series = clean;
   if (tfMinutes > 0 && series.length > 0) {
-    const lastOpenMs = new Date(series[series.length - 1].time).getTime();
+    const lastOpenMs = parseCandleMs(series[series.length - 1].time);
     const inProgress =
       Number.isFinite(lastOpenMs) &&
       nowMs >= lastOpenMs &&
@@ -139,7 +147,7 @@ export function buildSessions(
   // Agrupar por fecha (UTC del tiempo de broker — frontera estable)
   const byDate = new Map<string, TMBar[]>();
   for (const c of series) {
-    const t = new Date(c.time).getTime();
+    const t = parseCandleMs(c.time);
     if (!Number.isFinite(t)) continue;
     const date = new Date(t).toISOString().slice(0, 10);
     let arr = byDate.get(date);
